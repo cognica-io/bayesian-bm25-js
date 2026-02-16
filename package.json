@@ -1,6 +1,6 @@
 {
   "name": "bayesian-bm25",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bayesian probability transforms for BM25 retrieval scores",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,6 +19,18 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
+  "keywords": [
+    "bm25",
+    "bayesian",
+    "information-retrieval",
+    "search",
+    "probability",
+    "text-search",
+    "ranking",
+    "relevance",
+    "score-fusion",
+    "nlp"
+  ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
