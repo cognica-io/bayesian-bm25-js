@@ -77,33 +77,39 @@ describe("probOr", () => {
 
 describe("logOddsConjunction", () => {
   it("amplifies agreeing high probabilities", () => {
+    // l_bar=logit(0.9)=2.197, l_adjusted=2.197*sqrt(2)=3.107, sigmoid(3.107)=0.957
     const result = logOddsConjunction([0.9, 0.9]);
-    expect(result).toBeCloseTo(0.927, 1);
+    expect(result).toBeCloseTo(0.957, 1);
     expect(result).toBeGreaterThan(0.9);
   });
 
   it("handles moderate agreement", () => {
+    // l_bar=logit(0.7)=0.847, l_adjusted=0.847*sqrt(2)=1.198, sigmoid(1.198)=0.768
     const result = logOddsConjunction([0.7, 0.7]);
     expect(result).toBeCloseTo(0.77, 1);
     expect(result).toBeGreaterThan(0.7);
   });
 
   it("moderates disagreement", () => {
+    // logit(0.7)=0.847, logit(0.3)=-0.847, l_bar=0, sigmoid(0)=0.5
     const result = logOddsConjunction([0.7, 0.3]);
-    expect(result).toBeCloseTo(0.54, 1);
-    expect(result).toBeGreaterThan(0.45);
-    expect(result).toBeLessThan(0.65);
+    expect(result).toBeCloseTo(0.5, 1);
+    // Symmetric logits cancel to exact uncertainty
+    expect(result).toBeGreaterThan(0.49);
+    expect(result).toBeLessThan(0.51);
   });
 
   it("handles agreeing low probabilities", () => {
+    // l_bar=logit(0.3)=-0.847, l_adjusted=-0.847*sqrt(2)=-1.198, sigmoid(-1.198)=0.232
     const result = logOddsConjunction([0.3, 0.3]);
-    expect(result).toBeCloseTo(0.38, 1);
+    expect(result).toBeCloseTo(0.23, 1);
     expect(result).toBeGreaterThan(probAnd([0.3, 0.3]) as number);
   });
 
   it("preserves near-0.5 for irrelevant signals", () => {
+    // logit(0.5)=0, l_bar=0, l_adjusted=0, sigmoid(0)=0.5
     const result = logOddsConjunction([0.5, 0.5]);
-    expect(Math.abs(result - 0.5)).toBeLessThan(0.1);
+    expect(result).toBeCloseTo(0.5, 1);
   });
 
   it("passes through single signal with alpha=0", () => {

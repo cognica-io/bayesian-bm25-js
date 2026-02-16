@@ -9,8 +9,8 @@
 // Implements AND, OR, and log-odds conjunction for combining multiple
 // probability estimates. The log-odds conjunction (from "From Bayesian
 // Inference to Neural Computation") resolves the shrinkage problem of
-// naive probabilistic AND by using geometric-mean log-odds with an
-// agreement bonus.
+// naive probabilistic AND by using multiplicative confidence scaling
+// in log-odds space.
 
 import { clampProbability, logit, sigmoid } from "./probability.js";
 
@@ -68,26 +68,31 @@ function logOddsConjunctionSingle(probs: number[], alpha: number): number {
   const clamped = clampProbability(probs);
   const n = clamped.length;
 
-  // Step 1: geometric mean -- exp(mean(log(p_i)))
-  let logSum = 0;
-  for (const p of clamped) {
-    logSum += Math.log(p);
+  // Step 1: mean log-odds (Eq. 20)
+  const logitValues = logit(clamped) as number[];
+  let logitSum = 0;
+  for (const l of logitValues) {
+    logitSum += l;
   }
-  const geometricMean = Math.exp(logSum / n);
+  const lBar = logitSum / n;
 
-  // Step 2: log-odds with agreement bonus
-  const logOdds = (logit(geometricMean) as number) + alpha * Math.log(n);
+  // Step 2: multiplicative confidence scaling (Eq. 23)
+  const lAdjusted = lBar * n ** alpha;
 
-  // Step 3: back to probability
-  return sigmoid(logOdds) as number;
+  // Step 3: back to probability (Eq. 26)
+  return sigmoid(lAdjusted) as number;
 }
 
-// Log-odds conjunction with agreement bonus (Paper 2, Section 4).
+// Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
 //
 // Resolves the shrinkage problem of naive probabilistic AND by:
-//   1. Computing the geometric mean in probability space
-//   2. Converting to log-odds and adding an agreement bonus
-//   3. Converting back to probability
+//   1. Computing the mean log-odds (Eq. 20)
+//   2. Multiplicative confidence scaling by n^alpha (Eq. 23)
+//   3. Converting back to probability via sigmoid (Eq. 26)
+//
+// The multiplicative formulation (rather than additive) preserves the
+// sign of evidence (Theorem 4.2.2), preventing accidental inversion
+// of irrelevance signals (Remark 4.2.4).
 export function logOddsConjunction(
   probs: number[],
   alpha?: number,
