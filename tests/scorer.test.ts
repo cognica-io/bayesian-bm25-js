@@ -196,3 +196,68 @@ describe("error before index", () => {
     expect(() => scorer.avgdl).toThrow(/index/);
   });
 });
+
+describe("baseRate", () => {
+  it("default scorer has baseRate=null", () => {
+    const scorer = createScorer();
+    expect(scorer.baseRate).toBeNull();
+  });
+
+  it("explicit baseRate is stored and used", () => {
+    const scorer = new BayesianBM25Scorer({
+      k1: 1.2,
+      b: 0.75,
+      method: "lucene",
+      baseRate: 0.01,
+    });
+    scorer.index(smallCorpus);
+    expect(scorer.baseRate).toBeCloseTo(0.01);
+  });
+
+  it("auto baseRate produces a float in (0, 1)", () => {
+    const scorer = new BayesianBM25Scorer({
+      k1: 1.2,
+      b: 0.75,
+      method: "lucene",
+      baseRate: "auto",
+    });
+    scorer.index(smallCorpus);
+    expect(scorer.baseRate).not.toBeNull();
+    expect(scorer.baseRate!).toBeGreaterThan(0.0);
+    expect(scorer.baseRate!).toBeLessThan(1.0);
+  });
+
+  it("baseRate reduces probabilities", () => {
+    const sNone = createScorer();
+    const sLow = new BayesianBM25Scorer({
+      k1: 1.2,
+      b: 0.75,
+      method: "lucene",
+      baseRate: 0.01,
+    });
+    sLow.index(smallCorpus);
+
+    const pNone = sNone.getProbabilities(["cat"]);
+    const pLow = sLow.getProbabilities(["cat"]);
+    for (let i = 0; i < pNone.length; i++) {
+      if (pNone[i]! > 0) {
+        expect(pLow[i]!).toBeLessThan(pNone[i]!);
+      }
+    }
+  });
+
+  it("baseRate preserves document ranking", () => {
+    const scorer = new BayesianBM25Scorer({
+      k1: 1.2,
+      b: 0.75,
+      method: "lucene",
+      baseRate: 0.01,
+    });
+    scorer.index(smallCorpus);
+    const { probabilities } = scorer.retrieve([["cat"]], 6);
+    const nonzeroProbs = probabilities[0]!.filter((p) => p > 0);
+    for (let i = 1; i < nonzeroProbs.length; i++) {
+      expect(nonzeroProbs[i]!).toBeLessThanOrEqual(nonzeroProbs[i - 1]!);
+    }
+  });
+});

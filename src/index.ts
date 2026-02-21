@@ -12,9 +12,11 @@ export {
   EPSILON,
   type FitOptions,
   type UpdateOptions,
+  type TrainingMode,
 } from "./probability.js";
 
 export {
+  cosineToProbability,
   probAnd,
   probOr,
   logOddsConjunction,

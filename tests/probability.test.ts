@@ -10,6 +10,7 @@ import {
   BayesianProbabilityTransform,
   logit,
   sigmoid,
+  EPSILON,
 } from "../src/probability.js";
 
 describe("sigmoid", () => {
@@ -364,5 +365,109 @@ describe("onlineUpdate", () => {
     };
 
     expect(variance(diffHigh)).toBeLessThan(variance(diffLow));
+  });
+});
+
+describe("baseRate", () => {
+  it("baseRate=null produces identical output to no base rate", () => {
+    const tNone = new BayesianProbabilityTransform(1.0, 0.5, null);
+    for (const score of [0.5, 1.0, 2.0, 3.0]) {
+      const prob = tNone.scoreToProbability(score, 5, 0.5) as number;
+      expect(prob).toBeGreaterThan(0);
+      expect(prob).toBeLessThan(1);
+    }
+  });
+
+  it("baseRate=0.5 is neutral (logit(0.5)=0)", () => {
+    const tHalf = new BayesianProbabilityTransform(1.0, 0.5, 0.5);
+    const tNone = new BayesianProbabilityTransform(1.0, 0.5, null);
+    for (const score of [0.5, 1.0, 2.0, 3.0]) {
+      const pHalf = tHalf.scoreToProbability(score, 5, 0.5) as number;
+      const pNone = tNone.scoreToProbability(score, 5, 0.5) as number;
+      expect(pHalf).toBeCloseTo(pNone, 4);
+    }
+  });
+
+  it("low baseRate reduces probabilities", () => {
+    const tLow = new BayesianProbabilityTransform(1.0, 0.5, 0.01);
+    const tNone = new BayesianProbabilityTransform(1.0, 0.5, null);
+    for (const score of [0.5, 1.0, 2.0, 3.0]) {
+      const pLow = tLow.scoreToProbability(score, 5, 0.5) as number;
+      const pNone = tNone.scoreToProbability(score, 5, 0.5) as number;
+      expect(pLow).toBeLessThan(pNone);
+    }
+  });
+
+  it("high baseRate increases probabilities", () => {
+    const tHigh = new BayesianProbabilityTransform(1.0, 0.5, 0.9);
+    const tNone = new BayesianProbabilityTransform(1.0, 0.5, null);
+    for (const score of [0.5, 1.0, 2.0, 3.0]) {
+      const pHigh = tHigh.scoreToProbability(score, 5, 0.5) as number;
+      const pNone = tNone.scoreToProbability(score, 5, 0.5) as number;
+      expect(pHigh).toBeGreaterThan(pNone);
+    }
+  });
+
+  it("preserves score ordering with any baseRate", () => {
+    for (const br of [0.01, 0.1, 0.5, 0.9]) {
+      const t = new BayesianProbabilityTransform(1.0, 0.5, br);
+      const scores = [0.5, 1.0, 2.0, 3.0];
+      const probs = t.scoreToProbability(
+        scores,
+        scores.map(() => 5),
+        scores.map(() => 0.5),
+      ) as number[];
+      for (let i = 1; i < probs.length; i++) {
+        expect(probs[i]!).toBeGreaterThan(probs[i - 1]!);
+      }
+    }
+  });
+
+  it("all probabilities stay in (0, 1)", () => {
+    for (const br of [0.01, 0.1, 0.5, 0.9]) {
+      const t = new BayesianProbabilityTransform(1.0, 0.5, br);
+      const scores = [0.1, 0.5, 1.0, 2.0, 5.0];
+      const probs = t.scoreToProbability(
+        scores,
+        scores.map(() => 5),
+        scores.map(() => 0.5),
+      ) as number[];
+      for (const p of probs) {
+        expect(p).toBeGreaterThan(0);
+        expect(p).toBeLessThan(1);
+      }
+    }
+  });
+
+  it("rejects invalid baseRate", () => {
+    expect(() => new BayesianProbabilityTransform(1.0, 0.0, 0.0)).toThrow(
+      /baseRate must be in/,
+    );
+    expect(() => new BayesianProbabilityTransform(1.0, 0.0, 1.0)).toThrow(
+      /baseRate must be in/,
+    );
+    expect(() => new BayesianProbabilityTransform(1.0, 0.0, -0.5)).toThrow(
+      /baseRate must be in/,
+    );
+  });
+
+  it("fit preserves baseRate", () => {
+    const t = new BayesianProbabilityTransform(1.0, 0.0, 0.01);
+    t.fit([0.0, 1.0, 2.0], [0.0, 0.5, 1.0], { maxIterations: 10 });
+    expect(t.baseRate).toBe(0.01);
+  });
+
+  it("update preserves baseRate", () => {
+    const t = new BayesianProbabilityTransform(1.0, 0.0, 0.05);
+    t.update(2.0, 1.0, { learningRate: 0.01 });
+    expect(t.baseRate).toBe(0.05);
+  });
+
+  it("posterior static with baseRate shifts probabilities", () => {
+    const L = 0.7;
+    const p = 0.6;
+    const pWithout = BayesianProbabilityTransform.posterior(L, p);
+    const pWithBR = BayesianProbabilityTransform.posterior(L, p, 0.01);
+    expect(pWithBR).toBeLessThan(pWithout);
   });
 });

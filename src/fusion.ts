@@ -14,6 +14,21 @@
 
 import { clampProbability, logit, sigmoid } from "./probability.js";
 
+// Convert cosine similarity to probability (Definition 7.1.2).
+//
+// Maps cosine similarity in [-1, 1] to probability in (0, 1) via
+// P_vector = (1 + score) / 2, with epsilon clamping for numerical stability.
+export function cosineToProbability(score: number): number;
+export function cosineToProbability(score: number[]): number[];
+export function cosineToProbability(
+  score: number | number[],
+): number | number[] {
+  if (Array.isArray(score)) {
+    return clampProbability(score.map((s) => (1.0 + s) / 2.0));
+  }
+  return clampProbability((1.0 + score) / 2.0);
+}
+
 function is2D(probs: number[] | number[][]): probs is number[][] {
   return Array.isArray(probs[0]);
 }
@@ -83,6 +98,19 @@ function logOddsConjunctionSingle(probs: number[], alpha: number): number {
   return sigmoid(lAdjusted) as number;
 }
 
+function logOddsWeightedSingle(
+  probs: number[],
+  weights: number[],
+): number {
+  const clamped = clampProbability(probs);
+  const logitValues = logit(clamped) as number[];
+  let weightedSum = 0;
+  for (let i = 0; i < logitValues.length; i++) {
+    weightedSum += weights[i]! * logitValues[i]!;
+  }
+  return sigmoid(weightedSum) as number;
+}
+
 // Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
 //
 // Resolves the shrinkage problem of naive probabilistic AND by:
@@ -90,22 +118,51 @@ function logOddsConjunctionSingle(probs: number[], alpha: number): number {
 //   2. Multiplicative confidence scaling by n^alpha (Eq. 23)
 //   3. Converting back to probability via sigmoid (Eq. 26)
 //
+// When weights are provided, uses the Log-OP (Log-linear Opinion
+// Pool) formulation from Paper 2, Theorem 8.3 / Remark 8.4 instead:
+// sigma(sum(w_i * logit(P_i))) where sum(w_i) = 1 and w_i >= 0.
+// The alpha parameter is ignored in weighted mode.
+//
 // The multiplicative formulation (rather than additive) preserves the
 // sign of evidence (Theorem 4.2.2), preventing accidental inversion
 // of irrelevance signals (Remark 4.2.4).
 export function logOddsConjunction(
   probs: number[],
   alpha?: number,
+  weights?: number[],
 ): number;
 export function logOddsConjunction(
   probs: number[][],
   alpha?: number,
+  weights?: number[],
 ): number[];
 export function logOddsConjunction(
   probs: number[] | number[][],
   alpha: number = 0.5,
+  weights?: number[],
 ): number | number[] {
   if (probs.length === 0) return 0;
+
+  if (weights !== undefined) {
+    for (const w of weights) {
+      if (w < 0) {
+        throw new Error("weights must be non-negative");
+      }
+    }
+    let weightSum = 0;
+    for (const w of weights) {
+      weightSum += w;
+    }
+    if (Math.abs(weightSum - 1.0) > 1e-6) {
+      throw new Error(`weights must sum to 1, got ${weightSum}`);
+    }
+
+    if (is2D(probs)) {
+      return probs.map((row) => logOddsWeightedSingle(row, weights));
+    }
+    return logOddsWeightedSingle(probs as number[], weights);
+  }
+
   if (is2D(probs)) {
     return probs.map((row) => logOddsConjunctionSingle(row, alpha));
   }

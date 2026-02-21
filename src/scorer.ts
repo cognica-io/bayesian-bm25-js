@@ -19,6 +19,7 @@ export interface BayesianBM25ScorerOptions {
   method?: BM25Method;
   alpha?: number;
   beta?: number;
+  baseRate?: number | "auto" | null;
 }
 
 export interface RetrieveResult {
@@ -75,10 +76,22 @@ function stddev(values: number[]): number {
 }
 
 // BM25 scorer that returns Bayesian-calibrated probabilities.
+//
+// Parameters:
+//   k1:       BM25 k1 parameter (term frequency saturation).
+//   b:        BM25 b parameter (document length normalisation).
+//   method:   BM25 variant: "robertson", "lucene", or "atire".
+//   alpha:    Sigmoid steepness.  If undefined, auto-estimated from corpus.
+//   beta:     Sigmoid midpoint.  If undefined, auto-estimated from corpus.
+//   baseRate: Corpus-level base rate of relevance.
+//             - null/undefined (default): no base rate correction.
+//             - "auto": auto-estimate from corpus score distribution.
+//             - number in (0, 1): explicit base rate.
 export class BayesianBM25Scorer {
   private _bm25: BM25;
   private _userAlpha: number | undefined;
   private _userBeta: number | undefined;
+  private _userBaseRate: number | "auto" | null;
   private _transform: BayesianProbabilityTransform | null = null;
   private _docLengths: number[] | null = null;
   private _avgdl: number | null = null;
@@ -92,6 +105,7 @@ export class BayesianBM25Scorer {
     });
     this._userAlpha = options.alpha;
     this._userBeta = options.beta;
+    this._userBaseRate = options.baseRate ?? null;
   }
 
   get numDocs(): number {
@@ -112,6 +126,13 @@ export class BayesianBM25Scorer {
     return this._avgdl;
   }
 
+  get baseRate(): number | null {
+    if (this._transform === null) {
+      return null;
+    }
+    return this._transform.baseRate;
+  }
+
   // Build the BM25 index and compute document statistics.
   index(corpusTokens: string[][]): void {
     this._corpusTokens = corpusTokens;
@@ -129,7 +150,51 @@ export class BayesianBM25Scorer {
         : 0;
 
     const [alpha, beta] = this._estimateParameters(corpusTokens);
-    this._transform = new BayesianProbabilityTransform(alpha, beta);
+
+    // Resolve baseRate
+    let baseRate: number | null = null;
+    if (this._userBaseRate === "auto") {
+      baseRate = this._estimateBaseRate(corpusTokens);
+    } else if (
+      typeof this._userBaseRate === "number"
+    ) {
+      baseRate = this._userBaseRate;
+    }
+
+    this._transform = new BayesianProbabilityTransform(
+      alpha,
+      beta,
+      baseRate,
+    );
+  }
+
+  private _samplePseudoQueryScores(
+    corpusTokens: string[][],
+  ): number[][] {
+    const n = corpusTokens.length;
+    const sampleSize = Math.min(n, 50);
+    const rng = mulberry32(42);
+    const sampleIndices = sampleWithoutReplacement(n, sampleSize, rng);
+
+    const perQueryScores: number[][] = [];
+    for (const idx of sampleIndices) {
+      const queryTokens = corpusTokens[idx]!;
+      if (queryTokens.length === 0) continue;
+
+      const query = queryTokens.slice(0, 5);
+      const scores = this._bm25.getScores(query);
+
+      const nonzero: number[] = [];
+      for (const score of scores) {
+        if (score > 0) {
+          nonzero.push(score);
+        }
+      }
+      if (nonzero.length > 0) {
+        perQueryScores.push(nonzero);
+      }
+    }
+    return perQueryScores;
   }
 
   private _estimateParameters(
@@ -139,28 +204,17 @@ export class BayesianBM25Scorer {
       return [this._userAlpha, this._userBeta];
     }
 
-    const n = corpusTokens.length;
-    const sampleSize = Math.min(n, 50);
-    const rng = mulberry32(42);
-    const sampleIndices = sampleWithoutReplacement(n, sampleSize, rng);
+    const perQueryScores = this._samplePseudoQueryScores(corpusTokens);
 
-    const allScores: number[] = [];
-    for (const idx of sampleIndices) {
-      const queryTokens = corpusTokens[idx]!;
-      if (queryTokens.length === 0) continue;
-
-      const query = queryTokens.slice(0, 5);
-      const scores = this._bm25.getScores(query);
-
-      for (const score of scores) {
-        if (score > 0) {
-          allScores.push(score);
-        }
-      }
+    if (perQueryScores.length === 0) {
+      return [this._userAlpha ?? 1.0, this._userBeta ?? 0.0];
     }
 
-    if (allScores.length === 0) {
-      return [this._userAlpha ?? 1.0, this._userBeta ?? 0.0];
+    const allScores: number[] = [];
+    for (const queryScores of perQueryScores) {
+      for (const s of queryScores) {
+        allScores.push(s);
+      }
     }
 
     const estimatedBeta = median(allScores);
@@ -170,6 +224,36 @@ export class BayesianBM25Scorer {
     const alpha = this._userAlpha ?? estimatedAlpha;
     const beta = this._userBeta ?? estimatedBeta;
     return [alpha, beta];
+  }
+
+  private _estimateBaseRate(corpusTokens: string[][]): number {
+    const perQueryScores = this._samplePseudoQueryScores(corpusTokens);
+    const nDocs = corpusTokens.length;
+
+    if (perQueryScores.length === 0) {
+      return 1e-6;
+    }
+
+    const highCountRatios: number[] = [];
+    for (const scores of perQueryScores) {
+      const sorted = [...scores].sort((a, b) => a - b);
+      const pIdx = Math.ceil(sorted.length * 0.95) - 1;
+      const threshold = sorted[Math.max(0, pIdx)]!;
+      let nAbove = 0;
+      for (const s of scores) {
+        if (s >= threshold) {
+          nAbove++;
+        }
+      }
+      highCountRatios.push(nAbove / nDocs);
+    }
+
+    let sum = 0;
+    for (const r of highCountRatios) {
+      sum += r;
+    }
+    const baseRate = sum / highCountRatios.length;
+    return Math.max(1e-6, Math.min(0.5, baseRate));
   }
 
   // Retrieve top-k documents with Bayesian probabilities.

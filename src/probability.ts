@@ -56,10 +56,21 @@ export function logit(p: number | number[]): number | number[] {
   return logitScalar(p);
 }
 
+export type TrainingMode = "balanced" | "prior_aware" | "prior_free";
+
+const VALID_MODES: ReadonlySet<string> = new Set([
+  "balanced",
+  "prior_aware",
+  "prior_free",
+]);
+
 export interface FitOptions {
   learningRate?: number;
   maxIterations?: number;
   tolerance?: number;
+  mode?: TrainingMode;
+  tfs?: number[];
+  docLenRatios?: number[];
 }
 
 export interface UpdateOptions {
@@ -68,22 +79,49 @@ export interface UpdateOptions {
   decayTau?: number;
   maxGradNorm?: number;
   avgDecay?: number;
+  mode?: TrainingMode;
+  tf?: number | number[];
+  docLenRatio?: number | number[];
 }
 
 // Transforms raw BM25 scores into calibrated probabilities.
+//
+// Parameters:
+//   alpha:     Steepness of the sigmoid likelihood function.
+//   beta:      Midpoint (shift) of the sigmoid likelihood function.
+//   baseRate:  Corpus-level base rate of relevance, in (0, 1).
+//              When set, the posterior is computed in log-odds space as
+//              sigmoid(logit(L) + logit(baseRate) + logit(prior)).
+//              null (default) disables base rate correction.
+//              baseRate=0.5 is neutral (logit(0.5) = 0).
 export class BayesianProbabilityTransform {
   public alpha: number;
   public beta: number;
+  public readonly baseRate: number | null;
 
+  private _logitBaseRate: number | null;
+  private _trainingMode: TrainingMode = "balanced";
   private _nUpdates: number = 0;
   private _gradAlphaEMA: number = 0.0;
   private _gradBetaEMA: number = 0.0;
   private _alphaAvg: number;
   private _betaAvg: number;
 
-  constructor(alpha: number = 1.0, beta: number = 0.0) {
+  constructor(
+    alpha: number = 1.0,
+    beta: number = 0.0,
+    baseRate: number | null = null,
+  ) {
+    if (baseRate !== null) {
+      if (baseRate <= 0.0 || baseRate >= 1.0) {
+        throw new Error(`baseRate must be in (0, 1), got ${baseRate}`);
+      }
+    }
     this.alpha = alpha;
     this.beta = beta;
+    this.baseRate = baseRate;
+    this._logitBaseRate =
+      baseRate !== null ? (logitScalar(baseRate) as number) : null;
     this._alphaAvg = alpha;
     this._betaAvg = beta;
   }
@@ -164,14 +202,33 @@ export class BayesianProbabilityTransform {
     return Math.max(0.1, Math.min(0.9, 0.7 * pTf + 0.3 * pNorm));
   }
 
-  // Bayesian posterior: L*p / (L*p + (1-L)*(1-p))  (Eq. 22)
-  static posterior(likelihoodVal: number, prior: number): number;
-  static posterior(likelihoodVal: number[], prior: number[]): number[];
+  // Bayesian posterior (Eq. 22).
+  //
+  // Without baseRate: L*p / (L*p + (1-L)*(1-p))
+  // With baseRate:    sigmoid(logit(L) + logit(baseRate) + logit(prior))
+  static posterior(
+    likelihoodVal: number,
+    prior: number,
+    baseRate?: number | null,
+  ): number;
+  static posterior(
+    likelihoodVal: number[],
+    prior: number[],
+    baseRate?: number | null,
+  ): number[];
   static posterior(
     likelihoodVal: number | number[],
     prior: number | number[],
+    baseRate: number | null = null,
   ): number | number[] {
     if (Array.isArray(likelihoodVal) && Array.isArray(prior)) {
+      if (baseRate !== null && baseRate !== undefined) {
+        return likelihoodVal.map((lv, i) => {
+          const logitSum =
+            logitScalar(lv) + logitScalar(baseRate) + logitScalar(prior[i]!);
+          return clampScalar(sigmoidScalar(logitSum));
+        });
+      }
       return likelihoodVal.map((lv, i) => {
         const p = prior[i]!;
         const numerator = lv * p;
@@ -181,12 +238,24 @@ export class BayesianProbabilityTransform {
     }
     const lv = likelihoodVal as number;
     const p = prior as number;
+    if (baseRate !== null && baseRate !== undefined) {
+      const logitSum =
+        logitScalar(lv) + logitScalar(baseRate) + logitScalar(p);
+      return clampScalar(sigmoidScalar(logitSum));
+    }
     const numerator = lv * p;
     const denominator = numerator + (1.0 - lv) * (1.0 - p);
     return clampScalar(numerator / denominator);
   }
 
   // Full pipeline: BM25 score -> calibrated probability.
+  //
+  // Computes likelihood from the score, composite prior from tf and
+  // docLenRatio, then applies the Bayesian posterior formula.
+  // When baseRate is set, uses the three-term log-odds formulation.
+  //
+  // In prior_free mode (C3), uses prior=0.5 so the posterior equals the
+  // likelihood, ignoring the composite prior at inference time.
   scoreToProbability(
     score: number,
     tf: number,
@@ -208,46 +277,149 @@ export class BayesianProbabilityTransform {
       Array.isArray(docLenRatio)
     ) {
       const lVal = this.likelihood(score);
-      const prior = BayesianProbabilityTransform.compositePrior(
-        tf,
-        docLenRatio,
-      );
+      const prior =
+        this._trainingMode === "prior_free"
+          ? score.map(() => 0.5)
+          : BayesianProbabilityTransform.compositePrior(tf, docLenRatio);
+
+      if (this.baseRate !== null) {
+        const p2 = BayesianProbabilityTransform.posterior(lVal, prior);
+        const br = this.baseRate;
+        return p2.map((p2v) => {
+          const numerator = p2v * br;
+          const denominator = numerator + (1.0 - p2v) * (1.0 - br);
+          return clampScalar(numerator / denominator);
+        });
+      }
       return BayesianProbabilityTransform.posterior(lVal, prior);
     }
-    const lVal = this.likelihood(score as number);
-    const prior = BayesianProbabilityTransform.compositePrior(
-      tf as number,
-      docLenRatio as number,
-    );
-    return BayesianProbabilityTransform.posterior(
-      lVal as number,
-      prior as number,
-    );
+
+    const lVal = this.likelihood(score as number) as number;
+    const prior =
+      this._trainingMode === "prior_free"
+        ? 0.5
+        : (BayesianProbabilityTransform.compositePrior(
+            tf as number,
+            docLenRatio as number,
+          ) as number);
+
+    if (this.baseRate !== null) {
+      const p2 = BayesianProbabilityTransform.posterior(
+        lVal,
+        prior,
+      ) as number;
+      const br = this.baseRate;
+      const numerator = p2 * br;
+      const denominator = numerator + (1.0 - p2) * (1.0 - br);
+      return clampScalar(numerator / denominator);
+    }
+    return BayesianProbabilityTransform.posterior(lVal, prior);
   }
 
-  // Learn alpha and beta via gradient descent on binary cross-entropy.
+  // Compute the Bayesian WAND upper bound for safe document pruning (Theorem 6.1.2).
+  //
+  // Given a standard BM25 upper bound per term, computes the tightest
+  // safe Bayesian probability upper bound by assuming the maximum
+  // possible prior (pMax from Theorem 4.2.4).
+  //
+  // Any document's actual Bayesian probability is guaranteed to be
+  // at most this value, making it safe for WAND-style pruning.
+  wandUpperBound(bm25UpperBound: number): number;
+  wandUpperBound(bm25UpperBound: number[]): number[];
+  wandUpperBound(bm25UpperBound: number | number[]): number | number[] {
+    const pMax = 0.9;
+    if (Array.isArray(bm25UpperBound)) {
+      const lMax = this.likelihood(bm25UpperBound);
+      return BayesianProbabilityTransform.posterior(
+        lMax,
+        lMax.map(() => pMax),
+        this.baseRate,
+      );
+    }
+    const lMax = this.likelihood(bm25UpperBound) as number;
+    return BayesianProbabilityTransform.posterior(lMax, pMax, this.baseRate);
+  }
+
+  // Learn alpha and beta via gradient descent (Algorithm 8.3.1).
+  //
+  // Three training modes are supported (C1/C2/C3 conditions):
+  //
+  // - "balanced" (C1, default): trains on the sigmoid likelihood
+  //   pred = sigmoid(alpha*(s-beta)).
+  // - "prior_aware" (C2): trains on the full Bayesian posterior
+  //   pred = L*p / (L*p + (1-L)*(1-p)) where L is the sigmoid
+  //   likelihood and p is the composite prior.  Requires tfs
+  //   and docLenRatios.
+  // - "prior_free" (C3): same training as balanced, but at
+  //   inference time scoreToProbability uses prior=0.5
+  //   (posterior = likelihood).
   fit(scores: number[], labels: number[], options: FitOptions = {}): void {
     const {
       learningRate = 0.01,
       maxIterations = 1000,
       tolerance = 1e-6,
+      mode = "balanced",
+      tfs,
+      docLenRatios,
     } = options;
+
+    if (!VALID_MODES.has(mode)) {
+      throw new Error(
+        `mode must be one of "balanced", "prior_aware", "prior_free", got "${mode}"`,
+      );
+    }
+    if (mode === "prior_aware") {
+      if (tfs === undefined || docLenRatios === undefined) {
+        throw new Error(
+          "tfs and docLenRatios are required when mode='prior_aware'",
+        );
+      }
+    }
+
+    let priors: number[] | null = null;
+    if (mode === "prior_aware") {
+      priors = BayesianProbabilityTransform.compositePrior(
+        tfs!,
+        docLenRatios!,
+      );
+    }
 
     let alpha = this.alpha;
     let beta = this.beta;
 
     for (let iter = 0; iter < maxIterations; iter++) {
-      const predicted = scores.map((s) =>
+      const L = scores.map((s) =>
         clampScalar(sigmoidScalar(alpha * (s - beta))),
       );
 
       let gradAlpha = 0;
       let gradBeta = 0;
-      for (let i = 0; i < scores.length; i++) {
-        const error = predicted[i]! - labels[i]!;
-        gradAlpha += error * (scores[i]! - beta);
-        gradBeta += error * -alpha;
+
+      if (mode === "prior_aware") {
+        for (let i = 0; i < scores.length; i++) {
+          const lv = L[i]!;
+          const p = priors![i]!;
+          const denom = lv * p + (1.0 - lv) * (1.0 - p);
+          const predicted = clampScalar((lv * p) / denom);
+
+          // Chain rule: dBCE/dalpha = (P - y) * dP/dL * dL/dalpha
+          const dP_dL = (p * (1.0 - p)) / (denom * denom);
+          const dL_dalpha = lv * (1.0 - lv) * (scores[i]! - beta);
+          const dL_dbeta = -lv * (1.0 - lv) * alpha;
+
+          const error = predicted - labels[i]!;
+          gradAlpha += error * dP_dL * dL_dalpha;
+          gradBeta += error * dP_dL * dL_dbeta;
+        }
+      } else {
+        // balanced or prior_free: train on sigmoid likelihood
+        for (let i = 0; i < scores.length; i++) {
+          const error = L[i]! - labels[i]!;
+          gradAlpha += error * (scores[i]! - beta);
+          gradBeta += error * -alpha;
+        }
       }
+
       gradAlpha /= scores.length;
       gradBeta /= scores.length;
 
@@ -269,6 +441,7 @@ export class BayesianProbabilityTransform {
 
     this.alpha = alpha;
     this.beta = beta;
+    this._trainingMode = mode;
     this._nUpdates = 0;
     this._gradAlphaEMA = 0.0;
     this._gradBetaEMA = 0.0;
@@ -277,6 +450,13 @@ export class BayesianProbabilityTransform {
   }
 
   // Online update of alpha and beta from a single observation or mini-batch.
+  //
+  // Uses SGD with exponential moving average (EMA) of gradients to
+  // smooth out noise from individual feedback signals.  Alpha is
+  // constrained to remain positive.
+  //
+  // After each parameter step, Polyak-style EMA averaging is applied
+  // to produce stable averagedAlpha and averagedBeta values.
   update(
     score: number | number[],
     label: number | number[],
@@ -288,24 +468,71 @@ export class BayesianProbabilityTransform {
       decayTau = 1000.0,
       maxGradNorm = 1.0,
       avgDecay = 0.995,
+      mode,
+      tf,
+      docLenRatio,
     } = options;
+
+    const effectiveMode = mode !== undefined ? mode : this._trainingMode;
+    if (!VALID_MODES.has(effectiveMode)) {
+      throw new Error(
+        `mode must be one of "balanced", "prior_aware", "prior_free", got "${effectiveMode}"`,
+      );
+    }
+    if (effectiveMode === "prior_aware") {
+      if (tf === undefined || docLenRatio === undefined) {
+        throw new Error(
+          "tf and docLenRatio are required when mode='prior_aware'",
+        );
+      }
+    }
 
     const scores = Array.isArray(score) ? score : [score];
     const labels = Array.isArray(label) ? label : [label];
 
-    const predicted = scores.map((s) =>
+    const L = scores.map((s) =>
       clampScalar(sigmoidScalar(this.alpha * (s - this.beta))),
     );
 
     let gradAlpha = 0;
     let gradBeta = 0;
-    for (let i = 0; i < scores.length; i++) {
-      const error = predicted[i]! - labels[i]!;
-      gradAlpha += error * (scores[i]! - this.beta);
-      gradBeta += error * -this.alpha;
+
+    if (effectiveMode === "prior_aware") {
+      const tfs = Array.isArray(tf) ? tf : [tf!];
+      const dlrs = Array.isArray(docLenRatio) ? docLenRatio : [docLenRatio!];
+      const priors = BayesianProbabilityTransform.compositePrior(
+        tfs,
+        dlrs,
+      );
+
+      for (let i = 0; i < scores.length; i++) {
+        const lv = L[i]!;
+        const p = priors[i]!;
+        const denom = lv * p + (1.0 - lv) * (1.0 - p);
+        const predicted = clampScalar((lv * p) / denom);
+
+        const dP_dL = (p * (1.0 - p)) / (denom * denom);
+        const dL_dalpha = lv * (1.0 - lv) * (scores[i]! - this.beta);
+        const dL_dbeta = -lv * (1.0 - lv) * this.alpha;
+
+        const error = predicted - labels[i]!;
+        gradAlpha += error * dP_dL * dL_dalpha;
+        gradBeta += error * dP_dL * dL_dbeta;
+      }
+    } else {
+      for (let i = 0; i < scores.length; i++) {
+        const error = L[i]! - labels[i]!;
+        gradAlpha += error * (scores[i]! - this.beta);
+        gradBeta += error * -this.alpha;
+      }
     }
+
     gradAlpha /= scores.length;
     gradBeta /= scores.length;
+
+    if (mode !== undefined) {
+      this._trainingMode = effectiveMode;
+    }
 
     // EMA smoothing of gradients
     this._gradAlphaEMA =
