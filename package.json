@@ -1,6 +1,6 @@
 {
   "name": "bayesian-bm25",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Bayesian probability transforms for BM25 retrieval scores",
   "type": "module",
   "main": "./dist/index.js",
