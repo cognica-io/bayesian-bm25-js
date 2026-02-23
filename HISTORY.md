@@ -1,5 +1,34 @@
 # History
 
+## 0.3.0 (2026-02-23)
+
+- Add calibration metrics module
+  - `expectedCalibrationError()`: measures how well predicted probabilities
+    match actual relevance rates (lower is better)
+  - `brierScore()`: mean squared error between probabilities and labels
+  - `reliabilityDiagram()`: returns `[avgPredicted, avgActual, count]` per bin
+    for visual calibration assessment
+- Support alpha + weights composability in `logOddsConjunction()`
+  - Per-signal weights (Theorem 8.3) and confidence scaling by signal count
+    (Section 4.2) are orthogonal and compose multiplicatively:
+    `sigma(n^alpha * sum(w_i * logit(P_i)))`
+  - Change `alpha` default from `0.5` to `undefined` for context-dependent
+    resolution: `undefined` resolves to `0.5` in unweighted mode and `0.0`
+    in weighted mode
+  - Explicit `alpha` applies in both unweighted and weighted modes
+- Add comprehensive theorem verification tests (63 tests)
+  - Paper 1 (Bayesian BM25): sigmoid properties, logit-sigmoid duality,
+    posterior formula equivalence, monotonicity, prior bounds, base rate
+    log-odds, Section 11.1 numerical values
+  - Paper 2 (From Bayesian Inference to Neural Computation): scale neutrality,
+    sign preservation, irrelevance non-inversion, Section 4.5 numerical table,
+    disagreement moderation, logistic regression equivalence, agreement
+    amplification, conjunction vs product rule, strict bounds, Log-OP
+    equivalence, heterogeneous signal combination, single signal identity,
+    weighted alpha composition, monotone shrinkage, information loss, sqrt(n)
+    scaling law, spread property, geometric mean residual, sigmoid uniqueness,
+    output range
+
 ## 0.2.0 (2026-02-21)
 
 - Add corpus-level base rate prior for unsupervised probability calibration

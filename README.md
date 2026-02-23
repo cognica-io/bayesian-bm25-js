@@ -11,9 +11,10 @@ Key capabilities:
 - **Score-to-probability transform** -- convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
 - **Base rate calibration** -- corpus-level base rate prior estimated from score distribution decomposes the posterior into three additive log-odds terms
 - **Parameter learning** -- batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** -- combine multiple probability signals using log-odds conjunction with optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
+- **Probabilistic fusion** -- combine multiple probability signals using log-odds conjunction with multiplicative confidence scaling and optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
 - **Hybrid search** -- `cosineToProbability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
 - **WAND pruning** -- `wandUpperBound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
+- **Calibration metrics** -- `expectedCalibrationError()`, `brierScore()`, and `reliabilityDiagram()` for evaluating probability quality
 - **Search integration** -- built-in BM25 scorer that returns probabilities instead of raw scores, with support for Robertson, Lucene, and ATIRE variants
 
 ## Installation
@@ -88,7 +89,10 @@ const vectorProbs = cosineToProbability(cosineScores);  // [0.96, 0.675, 0.85]
 
 // Fuse with reliability weights (BM25 weight=0.6, vector weight=0.4)
 const stacked = bm25Probs.map((bp, i) => [bp, vectorProbs[i]!]);
-const fused = logOddsConjunction(stacked, 0.5, [0.6, 0.4]);
+const fused = logOddsConjunction(stacked, undefined, [0.6, 0.4]);
+
+// Fuse with weights and confidence scaling (alpha + weights compose)
+const fusedScaled = logOddsConjunction(stacked, 0.5, [0.6, 0.4]);
 ```
 
 ### WAND Pruning with Bayesian Upper Bounds
@@ -104,6 +108,23 @@ const bm25UpperBound = 5.0;
 // Bayesian upper bound for safe pruning -- any document's actual
 // probability is guaranteed to be at most this value
 const bayesianBound = transform.wandUpperBound(bm25UpperBound);
+```
+
+### Evaluating Calibration Quality
+
+```typescript
+import {
+  expectedCalibrationError,
+  brierScore,
+  reliabilityDiagram,
+} from "bayesian-bm25";
+
+const probabilities = [0.9, 0.8, 0.3, 0.1, 0.7, 0.2];
+const labels = [1.0, 1.0, 0.0, 0.0, 1.0, 0.0];
+
+const ece = expectedCalibrationError(probabilities, labels); // lower is better
+const bs = brierScore(probabilities, labels);                // lower is better
+const bins = reliabilityDiagram(probabilities, labels, 5);   // [avgPred, avgActual, count]
 ```
 
 ### Online Learning from User Feedback
@@ -197,6 +218,14 @@ The `baseRate` option accepts `null` (default, no correction), `"auto"` (estimat
 | `logOddsConjunction(probs, alpha?, weights?)` | Log-odds conjunction with optional per-signal weights (Theorem 8.3) |
 
 Fusion functions accept 1D (`number[]`) or batched 2D (`number[][]`) inputs.
+
+### Calibration Metrics
+
+| Function | Description |
+|---|---|
+| `expectedCalibrationError(probabilities, labels, nBins?)` | Expected Calibration Error -- measures predicted vs actual relevance rates |
+| `brierScore(probabilities, labels)` | Brier score -- mean squared error between probabilities and labels |
+| `reliabilityDiagram(probabilities, labels, nBins?)` | Reliability diagram data: `[avgPredicted, avgActual, count]` per bin |
 
 ### BM25
 
