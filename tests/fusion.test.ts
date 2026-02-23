@@ -205,12 +205,17 @@ describe("cosineToProbability", () => {
 });
 
 describe("weightedLogOddsConjunction", () => {
-  it("uniform weights match unweighted alpha=0", () => {
+  it("uniform weights match unweighted with same alpha", () => {
     const probs = [0.7, 0.8];
     const uniformW = [0.5, 0.5];
-    const weighted = logOddsConjunction(probs, 0.5, uniformW) as number;
-    const unweightedAlpha0 = logOddsConjunction(probs, 0.0) as number;
-    expect(weighted).toBeCloseTo(unweightedAlpha0, 10);
+    // Uniform weights w_i=1/n with explicit alpha must match unweighted
+    // with the same alpha (Theorem 8.3):
+    //   sigma(n^alpha * sum(1/n * logit(P_i))) = sigma(n^alpha * mean(logit(P_i)))
+    for (const alpha of [0.0, 0.5, 1.0, 2.0]) {
+      const weighted = logOddsConjunction(probs, alpha, uniformW) as number;
+      const unweighted = logOddsConjunction(probs, alpha) as number;
+      expect(weighted).toBeCloseTo(unweighted, 10);
+    }
   });
 
   it("higher weight on high probability increases result", () => {

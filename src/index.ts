@@ -23,6 +23,12 @@ export {
 } from "./fusion.js";
 
 export {
+  expectedCalibrationError,
+  brierScore,
+  reliabilityDiagram,
+} from "./metrics.js";
+
+export {
   BayesianBM25Scorer,
   type BayesianBM25ScorerOptions,
   type RetrieveResult,

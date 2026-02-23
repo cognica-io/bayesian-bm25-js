@@ -101,14 +101,18 @@ function logOddsConjunctionSingle(probs: number[], alpha: number): number {
 function logOddsWeightedSingle(
   probs: number[],
   weights: number[],
+  alpha: number,
 ): number {
   const clamped = clampProbability(probs);
+  const n = clamped.length;
   const logitValues = logit(clamped) as number[];
   let weightedSum = 0;
   for (let i = 0; i < logitValues.length; i++) {
     weightedSum += weights[i]! * logitValues[i]!;
   }
-  return sigmoid(weightedSum) as number;
+  // Log-OP with confidence scaling:
+  // sigma(n^alpha * sum(w_i * logit(P_i)))  (Theorem 8.3 + Section 4.2)
+  return sigmoid(n ** alpha * weightedSum) as number;
 }
 
 // Log-odds conjunction with multiplicative confidence scaling (Paper 2, Section 4).
@@ -138,7 +142,7 @@ export function logOddsConjunction(
 ): number[];
 export function logOddsConjunction(
   probs: number[] | number[][],
-  alpha: number = 0.5,
+  alpha?: number,
   weights?: number[],
 ): number | number[] {
   if (probs.length === 0) return 0;
@@ -157,14 +161,28 @@ export function logOddsConjunction(
       throw new Error(`weights must sum to 1, got ${weightSum}`);
     }
 
+    // Default alpha for weighted mode is 0.0 (no confidence scaling)
+    const effectiveAlpha = alpha ?? 0.0;
+
     if (is2D(probs)) {
-      return probs.map((row) => logOddsWeightedSingle(row, weights));
+      return probs.map((row) =>
+        logOddsWeightedSingle(row, weights, effectiveAlpha),
+      );
     }
-    return logOddsWeightedSingle(probs as number[], weights);
+    return logOddsWeightedSingle(
+      probs as number[],
+      weights,
+      effectiveAlpha,
+    );
   }
 
+  // Default alpha for unweighted mode is 0.5
+  const effectiveAlpha = alpha ?? 0.5;
+
   if (is2D(probs)) {
-    return probs.map((row) => logOddsConjunctionSingle(row, alpha));
+    return probs.map((row) =>
+      logOddsConjunctionSingle(row, effectiveAlpha),
+    );
   }
-  return logOddsConjunctionSingle(probs as number[], alpha);
+  return logOddsConjunctionSingle(probs as number[], effectiveAlpha);
 }
