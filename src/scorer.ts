@@ -149,15 +149,16 @@ export class BayesianBM25Scorer {
         ? totalLength / this._docLengths.length
         : 0;
 
-    const [alpha, beta] = this._estimateParameters(corpusTokens);
+    // Sample pseudo-query scores once, reuse for both estimation steps
+    const perQueryScores = this._samplePseudoQueryScores(corpusTokens);
+
+    const [alpha, beta] = this._estimateParameters(perQueryScores);
 
     // Resolve baseRate
     let baseRate: number | null = null;
     if (this._userBaseRate === "auto") {
-      baseRate = this._estimateBaseRate(corpusTokens);
-    } else if (
-      typeof this._userBaseRate === "number"
-    ) {
+      baseRate = this._estimateBaseRate(perQueryScores, corpusTokens.length);
+    } else if (typeof this._userBaseRate === "number") {
       baseRate = this._userBaseRate;
     }
 
@@ -198,13 +199,11 @@ export class BayesianBM25Scorer {
   }
 
   private _estimateParameters(
-    corpusTokens: string[][],
+    perQueryScores: number[][],
   ): [number, number] {
     if (this._userAlpha !== undefined && this._userBeta !== undefined) {
       return [this._userAlpha, this._userBeta];
     }
-
-    const perQueryScores = this._samplePseudoQueryScores(corpusTokens);
 
     if (perQueryScores.length === 0) {
       return [this._userAlpha ?? 1.0, this._userBeta ?? 0.0];
@@ -226,10 +225,10 @@ export class BayesianBM25Scorer {
     return [alpha, beta];
   }
 
-  private _estimateBaseRate(corpusTokens: string[][]): number {
-    const perQueryScores = this._samplePseudoQueryScores(corpusTokens);
-    const nDocs = corpusTokens.length;
-
+  private _estimateBaseRate(
+    perQueryScores: number[][],
+    nDocs: number,
+  ): number {
     if (perQueryScores.length === 0) {
       return 1e-6;
     }
@@ -291,15 +290,21 @@ export class BayesianBM25Scorer {
     return probabilities[0]!;
   }
 
-  private _computeTF(docTokens: string[], queryTokens: string[]): number {
+  private _computeTFBatch(
+    docIds: number[],
+    queryTokens: string[],
+  ): number[] {
     const querySet = new Set(queryTokens);
-    let count = 0;
-    for (const t of docTokens) {
-      if (querySet.has(t)) {
-        count++;
+    const corpusTokens = this._corpusTokens!;
+    return docIds.map((did) => {
+      let count = 0;
+      for (const t of corpusTokens[did]!) {
+        if (querySet.has(t)) {
+          count++;
+        }
       }
-    }
-    return count;
+      return count;
+    });
   }
 
   private _scoresToProbabilities(
@@ -313,28 +318,38 @@ export class BayesianBM25Scorer {
       const queryDocIds = docIds[qIdx]!;
       const queryScores = bm25Scores[qIdx]!;
       const query = queryTokensBatch[qIdx]!;
-      const queryProbs: number[] = [];
+      const queryProbs = new Array<number>(queryDocIds.length).fill(0.0);
 
+      // Collect active (nonzero-score) documents
+      const activeIndices: number[] = [];
+      const activeIds: number[] = [];
+      const activeScores: number[] = [];
       for (let dIdx = 0; dIdx < queryDocIds.length; dIdx++) {
-        const did = queryDocIds[dIdx]!;
-        const score = queryScores[dIdx]!;
-
-        if (score <= 0) {
-          queryProbs.push(0.0);
-          continue;
+        if (queryScores[dIdx]! > 0) {
+          activeIndices.push(dIdx);
+          activeIds.push(queryDocIds[dIdx]!);
+          activeScores.push(queryScores[dIdx]!);
         }
+      }
 
-        const docLen = this._docLengths![did]!;
-        const docLenRatio = docLen / this._avgdl!;
-        const tf = this._computeTF(this._corpusTokens![did]!, query);
+      if (activeIds.length === 0) {
+        probabilities.push(queryProbs);
+        continue;
+      }
 
-        queryProbs.push(
-          this._transform!.scoreToProbability(
-            score,
-            tf,
-            docLenRatio,
-          ) as number,
-        );
+      const docLenRatios = activeIds.map(
+        (did) => this._docLengths![did]! / this._avgdl!,
+      );
+      const tfs = this._computeTFBatch(activeIds, query);
+
+      const batchProbs = this._transform!.scoreToProbability(
+        activeScores,
+        tfs,
+        docLenRatios,
+      ) as number[];
+
+      for (let i = 0; i < activeIndices.length; i++) {
+        queryProbs[activeIndices[i]!] = batchProbs[i]!;
       }
 
       probabilities.push(queryProbs);

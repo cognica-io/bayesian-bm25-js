@@ -1,5 +1,20 @@
 # History
 
+## 0.3.2 (2026-02-25)
+
+- Optimize posterior computation using two-step Bayes update (Remark 4.4.5)
+  - Replaces `sigmoid(logit(L) + logit(br) + logit(p))` with two sequential
+    Bayes updates using only multiplication and division
+  - `scoreToProbability()` delegates to `posterior()` instead of duplicating
+    baseRate logic
+- Optimize scorer internals for faster retrieval
+  - `_scoresToProbabilities()` processes all k documents per query in one
+    batch call instead of a scalar-by-scalar inner loop
+  - Add `_computeTFBatch()` for batch term frequency computation
+  - Deduplicate pseudo-query sampling: `_samplePseudoQueryScores()` is
+    called once during indexing instead of separately by `_estimateParameters()`
+    and `_estimateBaseRate()`
+
 ## 0.3.0 (2026-02-23)
 
 - Add calibration metrics module

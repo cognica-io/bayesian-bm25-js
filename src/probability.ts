@@ -202,10 +202,16 @@ export class BayesianProbabilityTransform {
     return Math.max(0.1, Math.min(0.9, 0.7 * pTf + 0.3 * pNorm));
   }
 
-  // Bayesian posterior (Eq. 22).
+  // Bayesian posterior via two-step Bayes update (Eq. 22, Remark 4.4.5).
   //
-  // Without baseRate: L*p / (L*p + (1-L)*(1-p))
-  // With baseRate:    sigmoid(logit(L) + logit(baseRate) + logit(prior))
+  // Without baseRate:
+  //   P = L*p / (L*p + (1-L)*(1-p))
+  //
+  // With baseRate (two-step, avoids expensive logit/sigmoid):
+  //   Step 1: p1 = L*p / (L*p + (1-L)*(1-p))
+  //   Step 2: P  = p1*br / (p1*br + (1-p1)*(1-br))
+  //
+  // Equivalent to sigmoid(logit(L) + logit(prior) + logit(baseRate)).
   static posterior(
     likelihoodVal: number,
     prior: number,
@@ -222,37 +228,39 @@ export class BayesianProbabilityTransform {
     baseRate: number | null = null,
   ): number | number[] {
     if (Array.isArray(likelihoodVal) && Array.isArray(prior)) {
-      if (baseRate !== null && baseRate !== undefined) {
-        return likelihoodVal.map((lv, i) => {
-          const logitSum =
-            logitScalar(lv) + logitScalar(baseRate) + logitScalar(prior[i]!);
-          return clampScalar(sigmoidScalar(logitSum));
-        });
-      }
       return likelihoodVal.map((lv, i) => {
         const p = prior[i]!;
         const numerator = lv * p;
         const denominator = numerator + (1.0 - lv) * (1.0 - p);
-        return clampScalar(numerator / denominator);
+        let result = clampScalar(numerator / denominator);
+        if (baseRate !== null && baseRate !== undefined) {
+          const numeratorBR = result * baseRate;
+          const denominatorBR =
+            numeratorBR + (1.0 - result) * (1.0 - baseRate);
+          result = clampScalar(numeratorBR / denominatorBR);
+        }
+        return result;
       });
     }
     const lv = likelihoodVal as number;
     const p = prior as number;
-    if (baseRate !== null && baseRate !== undefined) {
-      const logitSum =
-        logitScalar(lv) + logitScalar(baseRate) + logitScalar(p);
-      return clampScalar(sigmoidScalar(logitSum));
-    }
     const numerator = lv * p;
     const denominator = numerator + (1.0 - lv) * (1.0 - p);
-    return clampScalar(numerator / denominator);
+    let result = clampScalar(numerator / denominator);
+    if (baseRate !== null && baseRate !== undefined) {
+      const numeratorBR = result * baseRate;
+      const denominatorBR = numeratorBR + (1.0 - result) * (1.0 - baseRate);
+      result = clampScalar(numeratorBR / denominatorBR);
+    }
+    return result;
   }
 
   // Full pipeline: BM25 score -> calibrated probability.
   //
   // Computes likelihood from the score, composite prior from tf and
   // docLenRatio, then applies the Bayesian posterior formula.
-  // When baseRate is set, uses the three-term log-odds formulation.
+  // When baseRate is set, the posterior includes baseRate via a
+  // two-step Bayes update (Remark 4.4.5).
   //
   // In prior_free mode (C3), uses prior=0.5 so the posterior equals the
   // likelihood, ignoring the composite prior at inference time.
@@ -282,16 +290,11 @@ export class BayesianProbabilityTransform {
           ? score.map(() => 0.5)
           : BayesianProbabilityTransform.compositePrior(tf, docLenRatio);
 
-      if (this.baseRate !== null) {
-        const p2 = BayesianProbabilityTransform.posterior(lVal, prior);
-        const br = this.baseRate;
-        return p2.map((p2v) => {
-          const numerator = p2v * br;
-          const denominator = numerator + (1.0 - p2v) * (1.0 - br);
-          return clampScalar(numerator / denominator);
-        });
-      }
-      return BayesianProbabilityTransform.posterior(lVal, prior);
+      return BayesianProbabilityTransform.posterior(
+        lVal,
+        prior,
+        this.baseRate,
+      );
     }
 
     const lVal = this.likelihood(score as number) as number;
@@ -303,17 +306,7 @@ export class BayesianProbabilityTransform {
             docLenRatio as number,
           ) as number);
 
-    if (this.baseRate !== null) {
-      const p2 = BayesianProbabilityTransform.posterior(
-        lVal,
-        prior,
-      ) as number;
-      const br = this.baseRate;
-      const numerator = p2 * br;
-      const denominator = numerator + (1.0 - p2) * (1.0 - br);
-      return clampScalar(numerator / denominator);
-    }
-    return BayesianProbabilityTransform.posterior(lVal, prior);
+    return BayesianProbabilityTransform.posterior(lVal, prior, this.baseRate);
   }
 
   // Compute the Bayesian WAND upper bound for safe document pruning (Theorem 6.1.2).
