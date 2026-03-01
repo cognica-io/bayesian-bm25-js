@@ -315,8 +315,8 @@ export class LearnableLogOddsWeights {
   }
 
   // Combine probability signals via weighted log-odds conjunction.
-  combine(probs: number[], useAveraged: boolean = false): number;
-  combine(probs: number[][], useAveraged: boolean = false): number[];
+  combine(probs: number[], useAveraged?: boolean): number;
+  combine(probs: number[][], useAveraged?: boolean): number[];
   combine(
     probs: number[] | number[][],
     useAveraged: boolean = false,
