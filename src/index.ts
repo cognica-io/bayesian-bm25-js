@@ -17,9 +17,12 @@ export {
 
 export {
   cosineToProbability,
+  probNot,
   probAnd,
   probOr,
   logOddsConjunction,
+  balancedLogOddsFusion,
+  LearnableLogOddsWeights,
 } from "./fusion.js";
 
 export {
@@ -35,3 +38,13 @@ export {
 } from "./scorer.js";
 
 export { BM25, type BM25Options, type BM25Method } from "./bm25.js";
+
+export {
+  FusionDebugger,
+  type BM25SignalTrace,
+  type VectorSignalTrace,
+  type NotTrace,
+  type FusionTrace,
+  type DocumentTrace,
+  type ComparisonResult,
+} from "./debug.js";
