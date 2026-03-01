@@ -1,5 +1,57 @@
 # History
 
+## 0.4.0 (2026-03-01)
+
+- Add `probNot()` for probabilistic negation (complement rule, Eq. 35)
+  - Computes `P(NOT R) = 1 - P(R)` with epsilon clamping for numerical stability
+  - In log-odds space, NOT corresponds to simple negation: `logit(1 - p) = -logit(p)`
+  - Composes naturally with `probAnd()`, `probOr()`, and `logOddsConjunction()`
+    for exclusion queries (e.g., "python AND NOT java")
+  - Satisfies De Morgan's laws: `NOT(A AND B) = OR(NOT A, NOT B)` and
+    `NOT(A OR B) = AND(NOT A, NOT B)`
+  - Accepts both scalar (`number`) and array (`number[]`) inputs
+- Add `balancedLogOddsFusion()` for hybrid sparse-dense retrieval
+  - Converts both Bayesian BM25 probabilities and dense cosine similarities
+    to logit space, min-max normalizes each to equalize voting power, and
+    combines with configurable weights
+  - Prevents heavy-tailed sparse logits (from sigmoid unwrapping) from
+    drowning the dense signal while preserving the Bayesian BM25 framework's
+    document-length and term-frequency priors
+  - Accepts `weight` parameter for asymmetric signal weighting (default 0.5)
+- Add `LearnableLogOddsWeights` for per-signal reliability learning (Remark 5.3.2)
+  - Learns weights from Naive Bayes uniform initialization (w_i = 1/n) to
+    per-signal reliability weights via softmax parameterization over
+    unconstrained logits
+  - Hebbian gradient: `dL/dz_j = n^alpha * (p - y) * w_j * (x_j - x_bar_w)`
+    (pre-synaptic activity x post-synaptic error, backprop-free)
+  - Batch `fit()` via gradient descent on BCE loss
+  - Online `update()` via SGD with EMA-smoothed gradients, bias correction,
+    L2 gradient clipping, learning rate decay, and Polyak averaging of weights
+    in the simplex
+  - Alpha (confidence scaling) is fixed, only weights are learned; the two are
+    orthogonal (Paper 2, Section 4.2)
+- Add `FusionDebugger` for transparent pipeline inspection
+  - Records every intermediate value through the full probability pipeline
+    (likelihood, prior, posterior, fusion) so you can trace why a document
+    received a particular fused score
+  - `traceBM25()`: trace a single BM25 score through sigmoid likelihood,
+    composite prior, and Bayesian posterior, capturing logit-space intermediates
+  - `traceVector()`: trace cosine similarity through probability conversion
+  - `traceFusion()`: trace the combination of multiple probability signals
+    with method-specific intermediates for `log_odds`, `prob_and`, `prob_or`,
+    and `prob_not`
+  - `traceNot()`: trace probabilistic negation (complement) of a single signal
+  - `traceDocument()`: full pipeline trace composing BM25 + vector + fusion
+    into a single `DocumentTrace` with all intermediate values
+  - `compare()`: compare two `DocumentTrace` objects to explain rank
+    differences, identifying the dominant signal and crossover stages where
+    signals disagree
+  - `formatTrace()`, `formatSummary()`, `formatComparison()`: human-readable
+    output for traces, one-line summaries, and side-by-side comparisons
+  - Support all four fusion methods as `method` parameter: `"log_odds"`,
+    `"prob_and"`, `"prob_or"`, `"prob_not"`
+  - Support hierarchical (nested) fusion and weighted log-odds fusion
+
 ## 0.3.2 (2026-02-25)
 
 - Optimize posterior computation using two-step Bayes update (Remark 4.4.5)

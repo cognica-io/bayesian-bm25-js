@@ -2,7 +2,7 @@ cff-version: 1.2.0
 title: "Bayesian BM25 for JavaScript/TypeScript"
 message: "If you use this software, please cite the following papers."
 type: software
-version: 0.3.2
+version: 0.4.0
 license: Apache-2.0
 repository-code: "https://github.com/cognica-io/bayesian-bm25-js"
 authors:

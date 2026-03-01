@@ -13,8 +13,12 @@ Key capabilities:
 - **Parameter learning** -- batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
 - **Probabilistic fusion** -- combine multiple probability signals using log-odds conjunction with multiplicative confidence scaling and optional per-signal reliability weights (Log-OP), which resolves the shrinkage problem of naive probabilistic AND
 - **Hybrid search** -- `cosineToProbability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
+- **Balanced fusion** -- `balancedLogOddsFusion()` min-max normalizes sparse and dense logits to equalize voting power before combining, preventing heavy-tailed BM25 logits from drowning the dense signal
+- **Boolean NOT** -- `probNot()` computes `P(NOT R) = 1 - P(R)` for exclusion queries, composing with `probAnd()`, `probOr()`, and `logOddsConjunction()` under De Morgan's laws
+- **Learnable weights** -- `LearnableLogOddsWeights` learns per-signal reliability weights via Hebbian gradient descent on BCE loss, with batch `fit()`, online `update()`, and Polyak averaging
 - **WAND pruning** -- `wandUpperBound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
 - **Calibration metrics** -- `expectedCalibrationError()`, `brierScore()`, and `reliabilityDiagram()` for evaluating probability quality
+- **Fusion debugging** -- `FusionDebugger` traces every intermediate value through the probability pipeline (likelihood, prior, posterior, fusion) and explains rank differences between documents
 - **Search integration** -- built-in BM25 scorer that returns probabilities instead of raw scores, with support for Robertson, Lucene, and ATIRE variants
 
 ## Installation
@@ -93,6 +97,93 @@ const fused = logOddsConjunction(stacked, undefined, [0.6, 0.4]);
 
 // Fuse with weights and confidence scaling (alpha + weights compose)
 const fusedScaled = logOddsConjunction(stacked, 0.5, [0.6, 0.4]);
+```
+
+### Boolean NOT (Exclusion Queries)
+
+```typescript
+import { probNot, probAnd, logOddsConjunction } from "bayesian-bm25";
+
+// "python AND NOT java": keep python-relevant, exclude java-relevant
+const pythonProb = 0.85;
+const javaProb = 0.70;
+
+const notJava = probNot(javaProb);                     // 0.30
+const exclusion = probAnd([pythonProb, notJava]);       // product rule
+const fusedExclusion = logOddsConjunction([pythonProb, notJava]); // log-odds
+
+// Array input
+const probs = [0.9, 0.7, 0.3];
+const complements = probNot(probs);  // [0.1, 0.3, 0.7]
+```
+
+### Balanced Sparse-Dense Fusion
+
+```typescript
+import { balancedLogOddsFusion } from "bayesian-bm25";
+
+// BM25 probabilities (from Bayesian BM25)
+const bm25Probs = [0.85, 0.60, 0.40];
+
+// Dense cosine similarities (from vector search)
+const cosineScores = [0.92, 0.35, 0.70];
+
+// Balanced fusion: normalizes logits before combining
+const fused = balancedLogOddsFusion(bm25Probs, cosineScores);
+
+// Asymmetric weighting (0.7 = sparse weight, 0.3 implicit dense weight)
+const fusedWeighted = balancedLogOddsFusion(bm25Probs, cosineScores, 0.7);
+```
+
+### Learnable Fusion Weights
+
+```typescript
+import { LearnableLogOddsWeights, logOddsConjunction } from "bayesian-bm25";
+
+// 3-signal hybrid system: BM25, vector, metadata
+const learner = new LearnableLogOddsWeights(3);
+
+// Batch training on labeled data
+const signalsBatch = [
+  [0.9, 0.8, 0.3],  // doc 1: BM25 and vector agree
+  [0.2, 0.7, 0.6],  // doc 2: vector is more reliable
+  [0.8, 0.3, 0.9],  // doc 3: BM25 and metadata agree
+];
+const labels = [1, 1, 1];
+learner.fit(signalsBatch, labels);
+
+console.log(learner.weights);          // learned reliability weights
+console.log(learner.averagedWeights);  // Polyak-averaged (smoother)
+
+// Combine signals using learned weights
+const fused = learner.combine([0.85, 0.70, 0.50]);
+
+// Online update from live feedback
+learner.update([0.75, 0.60, 0.40], 1.0, { learningRate: 0.01 });
+```
+
+### Debugging Fusion Decisions
+
+```typescript
+import { FusionDebugger, BayesianProbabilityTransform } from "bayesian-bm25";
+
+const transform = new BayesianProbabilityTransform(1.5, 1.0, 0.01);
+const debugger_ = new FusionDebugger(transform);
+
+// Trace a BM25 score through the full probability pipeline
+const bm25Trace = debugger_.traceBM25(2.5, 3, 0.8);
+console.log(debugger_.formatTrace(bm25Trace));
+// => "BM25  score=2.500  L=0.818  prior=0.650  post=0.790"
+
+// Full document trace (BM25 + vector + fusion)
+const docTrace = debugger_.traceDocument(2.5, 3, 0.8, 0.85);
+console.log(debugger_.formatSummary(docTrace));
+
+// Compare two documents to explain rank differences
+const docA = debugger_.traceDocument(3.0, 5, 0.9, 0.80);
+const docB = debugger_.traceDocument(1.5, 2, 1.2, 0.95);
+const comparison = debugger_.compare(docA, docB);
+console.log(debugger_.formatComparison(comparison));
 ```
 
 ### WAND Pruning with Bayesian Upper Bounds
@@ -213,11 +304,55 @@ The `baseRate` option accepts `null` (default, no correction), `"auto"` (estimat
 | Function | Description |
 |---|---|
 | `cosineToProbability(score)` | Convert cosine similarity [-1, 1] to probability (Definition 7.1.2) |
+| `probNot(prob)` | Probabilistic NOT via complement rule: `1 - P(R)` (Eq. 35) |
 | `probAnd(probs)` | Probabilistic AND via product rule (Eq. 33-34) |
 | `probOr(probs)` | Probabilistic OR via complement rule (Eq. 36-37) |
 | `logOddsConjunction(probs, alpha?, weights?)` | Log-odds conjunction with optional per-signal weights (Theorem 8.3) |
+| `balancedLogOddsFusion(sparse, dense, weight?)` | Min-max normalized logit fusion for hybrid sparse-dense retrieval |
 
-Fusion functions accept 1D (`number[]`) or batched 2D (`number[][]`) inputs.
+`probNot` accepts scalar (`number`) or array (`number[]`) inputs. Other fusion functions accept 1D (`number[]`) or batched 2D (`number[][]`) inputs.
+
+### LearnableLogOddsWeights
+
+Learns per-signal reliability weights via Hebbian gradient descent (Remark 5.3.2).
+
+```typescript
+new LearnableLogOddsWeights(nSignals, alpha?)
+```
+
+| Method | Description |
+|---|---|
+| `combine(probs)` | Fuse signals using current weights via `logOddsConjunction()` |
+| `fit(signalsBatch, labels, options?)` | Batch gradient descent on BCE loss |
+| `update(signals, label, options?)` | Online SGD with EMA gradients and Polyak averaging |
+
+Properties: `weights`, `averagedWeights`, `nSignals`, `alpha`
+
+**FitOptions**: `learningRate`, `maxIterations`, `tolerance`, `useAveraged`
+
+**UpdateOptions**: `learningRate`, `momentum`, `decayTau`, `maxGradNorm`, `avgDecay`
+
+### FusionDebugger
+
+Traces intermediate values through the probability pipeline for debugging and explanation.
+
+```typescript
+new FusionDebugger(transform)
+```
+
+| Method | Description |
+|---|---|
+| `traceBM25(score, tf, docLenRatio)` | Trace BM25 score through likelihood, prior, posterior |
+| `traceVector(cosineSimilarity)` | Trace cosine similarity through probability conversion |
+| `traceNot(signalTrace)` | Trace probabilistic negation of a signal |
+| `traceFusion(signals, method?, weights?, alpha?)` | Trace signal combination with method-specific intermediates |
+| `traceDocument(score, tf, dlr, cos, method?, weights?, alpha?)` | Full pipeline trace: BM25 + vector + fusion |
+| `compare(traceA, traceB)` | Compare two document traces to explain rank differences |
+| `formatTrace(trace)` | Human-readable trace output |
+| `formatSummary(docTrace)` | One-line pipeline summary |
+| `formatComparison(comparison)` | Side-by-side document comparison |
+
+Fusion methods: `"log_odds"` (default), `"prob_and"`, `"prob_or"`, `"prob_not"`
 
 ### Calibration Metrics
 
