@@ -23,18 +23,23 @@ export {
   logOddsConjunction,
   balancedLogOddsFusion,
   LearnableLogOddsWeights,
+  AttentionLogOddsWeights,
+  resolveAlpha,
 } from "./fusion.js";
 
 export {
   expectedCalibrationError,
   brierScore,
   reliabilityDiagram,
+  CalibrationReport,
+  calibrationReport,
 } from "./metrics.js";
 
 export {
   BayesianBM25Scorer,
   type BayesianBM25ScorerOptions,
   type RetrieveResult,
+  type RetrievalResult,
 } from "./scorer.js";
 
 export { BM25, type BM25Options, type BM25Method } from "./bm25.js";
@@ -48,3 +53,8 @@ export {
   type DocumentTrace,
   type ComparisonResult,
 } from "./debug.js";
+
+export {
+  MultiFieldScorer,
+  type MultiFieldScorerOptions,
+} from "./multi_field.js";

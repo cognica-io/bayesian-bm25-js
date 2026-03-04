@@ -10,6 +10,8 @@ import {
   brierScore,
   expectedCalibrationError,
   reliabilityDiagram,
+  CalibrationReport,
+  calibrationReport,
 } from "../src/metrics.js";
 
 // Seeded PRNG (mulberry32) for deterministic tests.
@@ -180,11 +182,64 @@ describe("reliabilityDiagram", () => {
   });
 });
 
+describe("CalibrationReport", () => {
+  it("has all fields with correct types", () => {
+    const probs = [0.1, 0.2, 0.8, 0.9];
+    const labels = [0.0, 0.0, 1.0, 1.0];
+    const report = calibrationReport(probs, labels, 5);
+    expect(report).toBeInstanceOf(CalibrationReport);
+    expect(typeof report.ece).toBe("number");
+    expect(typeof report.brier).toBe("number");
+    expect(Array.isArray(report.reliability)).toBe(true);
+    expect(report.nSamples).toBe(4);
+    expect(report.nBins).toBe(5);
+  });
+
+  it("matches individual function calls", () => {
+    const rng = mulberry32(42);
+    const probs = randUniform(rng, 0, 1, 200);
+    const labels = probs.map(() => (rng() < 0.3 ? 1.0 : 0.0));
+
+    const report = calibrationReport(probs, labels, 10);
+
+    expect(report.ece).toBeCloseTo(
+      expectedCalibrationError(probs, labels, 10),
+    );
+    expect(report.brier).toBeCloseTo(brierScore(probs, labels));
+
+    const expectedReliability = reliabilityDiagram(probs, labels, 10);
+    expect(report.reliability).toHaveLength(expectedReliability.length);
+    for (let i = 0; i < expectedReliability.length; i++) {
+      expect(report.reliability[i]![0]).toBeCloseTo(
+        expectedReliability[i]![0],
+      );
+      expect(report.reliability[i]![1]).toBeCloseTo(
+        expectedReliability[i]![1],
+      );
+      expect(report.reliability[i]![2]).toBe(expectedReliability[i]![2]);
+    }
+  });
+
+  it("summary() returns formatted string", () => {
+    const probs = [0.1, 0.5, 0.9];
+    const labels = [0.0, 1.0, 1.0];
+    const report = calibrationReport(probs, labels, 5);
+    const text = report.summary();
+    expect(typeof text).toBe("string");
+    expect(text.length).toBeGreaterThan(0);
+    expect(text).toContain("ECE");
+    expect(text).toContain("Brier");
+    expect(text).toContain("Reliability");
+  });
+});
+
 describe("mainPackageExport", () => {
   it("metrics are importable from main package", async () => {
     const mod = await import("../src/index.js");
     expect(typeof mod.expectedCalibrationError).toBe("function");
     expect(typeof mod.brierScore).toBe("function");
     expect(typeof mod.reliabilityDiagram).toBe("function");
+    expect(typeof mod.calibrationReport).toBe("function");
+    expect(mod.CalibrationReport).toBeDefined();
   });
 });

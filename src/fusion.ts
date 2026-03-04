@@ -96,14 +96,61 @@ export function probOr(probs: number[] | number[][]): number | number[] {
   return probOrSingle(probs as number[]);
 }
 
-function logOddsConjunctionSingle(probs: number[], alpha: number): number {
+const _SQRT_N_ALPHA = 0.5; // alpha=0.5 implements the sqrt(n) scaling law (Theorem 4.2.1)
+
+// Resolve alpha parameter: "auto" -> sqrt(n) scaling, undefined -> default.
+export function resolveAlpha(
+  alpha: number | "auto" | undefined,
+  defaultValue: number,
+): number {
+  if (alpha === undefined) {
+    return defaultValue;
+  }
+  if (alpha === "auto") {
+    return _SQRT_N_ALPHA;
+  }
+  if (typeof alpha === "string") {
+    throw new Error(
+      `alpha must be a number, undefined, or "auto", got "${alpha}"`,
+    );
+  }
+  return alpha;
+}
+
+// Apply sparse-signal gating to logit values before aggregation.
+//
+// - "relu": MAP estimate under sparse prior (Theorem 6.5.3).
+//   Zeroes out weak/negative evidence: max(0, logit).
+// - "swish": Bayes estimate under sparse prior (Theorem 6.7.4).
+//   Soft gating: logit * sigmoid(logit).
+function applyGating(logitValues: number[], gating: string): number[] {
+  if (gating === "none") {
+    return logitValues;
+  }
+  if (gating === "relu") {
+    return logitValues.map((l) => Math.max(0.0, l));
+  }
+  if (gating === "swish") {
+    return logitValues.map((l) => l * (sigmoid(l) as number));
+  }
+  throw new Error(
+    `gating must be "none", "relu", or "swish", got "${gating}"`,
+  );
+}
+
+function logOddsConjunctionSingle(
+  probs: number[],
+  alpha: number,
+  gating: string,
+): number {
   const clamped = clampProbability(probs);
   const n = clamped.length;
 
   // Step 1: mean log-odds (Eq. 20)
-  const logitValues = logit(clamped) as number[];
+  const rawLogits = logit(clamped) as number[];
+  const gatedLogits = applyGating(rawLogits, gating);
   let logitSum = 0;
-  for (const l of logitValues) {
+  for (const l of gatedLogits) {
     logitSum += l;
   }
   const lBar = logitSum / n;
@@ -119,13 +166,15 @@ function logOddsWeightedSingle(
   probs: number[],
   weights: number[],
   alpha: number,
+  gating: string,
 ): number {
   const clamped = clampProbability(probs);
   const n = clamped.length;
-  const logitValues = logit(clamped) as number[];
+  const rawLogits = logit(clamped) as number[];
+  const gatedLogits = applyGating(rawLogits, gating);
   let weightedSum = 0;
-  for (let i = 0; i < logitValues.length; i++) {
-    weightedSum += weights[i]! * logitValues[i]!;
+  for (let i = 0; i < gatedLogits.length; i++) {
+    weightedSum += weights[i]! * gatedLogits[i]!;
   }
   // Log-OP with confidence scaling:
   // sigma(n^alpha * sum(w_i * logit(P_i)))  (Theorem 8.3 + Section 4.2)
@@ -141,26 +190,31 @@ function logOddsWeightedSingle(
 //
 // When weights are provided, uses the Log-OP (Log-linear Opinion
 // Pool) formulation from Paper 2, Theorem 8.3 / Remark 8.4 instead:
-// sigma(sum(w_i * logit(P_i))) where sum(w_i) = 1 and w_i >= 0.
-// The alpha parameter is ignored in weighted mode.
+// sigma(n^alpha * sum(w_i * logit(P_i))) where sum(w_i) = 1 and
+// w_i >= 0.  Per-signal weights (Theorem 8.3) and confidence scaling
+// by signal count (Section 4.2) are orthogonal and compose
+// multiplicatively.
 //
 // The multiplicative formulation (rather than additive) preserves the
 // sign of evidence (Theorem 4.2.2), preventing accidental inversion
 // of irrelevance signals (Remark 4.2.4).
 export function logOddsConjunction(
   probs: number[],
-  alpha?: number,
+  alpha?: number | "auto",
   weights?: number[],
+  gating?: string,
 ): number;
 export function logOddsConjunction(
   probs: number[][],
-  alpha?: number,
+  alpha?: number | "auto",
   weights?: number[],
+  gating?: string,
 ): number[];
 export function logOddsConjunction(
   probs: number[] | number[][],
-  alpha?: number,
+  alpha?: number | "auto",
   weights?: number[],
+  gating: string = "none",
 ): number | number[] {
   if (probs.length === 0) return 0;
 
@@ -178,30 +232,33 @@ export function logOddsConjunction(
       throw new Error(`weights must sum to 1, got ${weightSum}`);
     }
 
-    // Default alpha for weighted mode is 0.0 (no confidence scaling)
-    const effectiveAlpha = alpha ?? 0.0;
+    const effectiveAlpha = resolveAlpha(alpha, 0.0);
 
     if (is2D(probs)) {
       return probs.map((row) =>
-        logOddsWeightedSingle(row, weights, effectiveAlpha),
+        logOddsWeightedSingle(row, weights, effectiveAlpha, gating),
       );
     }
     return logOddsWeightedSingle(
       probs as number[],
       weights,
       effectiveAlpha,
+      gating,
     );
   }
 
-  // Default alpha for unweighted mode is 0.5
-  const effectiveAlpha = alpha ?? 0.5;
+  const effectiveAlpha = resolveAlpha(alpha, 0.5);
 
   if (is2D(probs)) {
     return probs.map((row) =>
-      logOddsConjunctionSingle(row, effectiveAlpha),
+      logOddsConjunctionSingle(row, effectiveAlpha, gating),
     );
   }
-  return logOddsConjunctionSingle(probs as number[], effectiveAlpha);
+  return logOddsConjunctionSingle(
+    probs as number[],
+    effectiveAlpha,
+    gating,
+  );
 }
 
 // Min-max normalize to [0, 1].  Returns zeros if range is negligible.
@@ -283,12 +340,12 @@ export class LearnableLogOddsWeights {
   private _gradLogitsEMA: number[];
   private _weightsAvg: number[];
 
-  constructor(nSignals: number, alpha: number = 0.0) {
+  constructor(nSignals: number, alpha: number | "auto" = 0.0) {
     if (nSignals < 1) {
       throw new Error(`n_signals must be >= 1, got ${nSignals}`);
     }
     this._nSignals = nSignals;
-    this._alpha = alpha;
+    this._alpha = resolveAlpha(alpha, 0.0);
 
     // Softmax parameterization: zeros -> uniform 1/n (Naive Bayes init)
     this._logits = new Array(nSignals).fill(0);
@@ -519,6 +576,500 @@ export class LearnableLogOddsWeights {
     for (let j = 0; j < n; j++) {
       this._weightsAvg[j] =
         avgDecay * this._weightsAvg[j]! + (1.0 - avgDecay) * rawWeights[j]!;
+    }
+  }
+}
+
+// Numerically stable softmax along rows of a 2D array.
+function softmax2D(z: number[][]): number[][] {
+  return z.map((row) => {
+    let maxZ = -Infinity;
+    for (const v of row) {
+      if (v > maxZ) maxZ = v;
+    }
+    const expZ = row.map((v) => Math.exp(v - maxZ));
+    let sum = 0;
+    for (const v of expZ) {
+      sum += v;
+    }
+    return expZ.map((v) => v / sum);
+  });
+}
+
+// Seeded PRNG (mulberry32) for deterministic initialization.
+function mulberry32(seed: number): () => number {
+  let s = seed | 0;
+  return () => {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Box-Muller transform: generate N(0, 1) samples from uniform.
+function randNormal(rng: () => number): number {
+  const u1 = rng();
+  const u2 = rng();
+  return Math.sqrt(-2.0 * Math.log(u1 || 1e-15)) * Math.cos(2.0 * Math.PI * u2);
+}
+
+// Query-dependent signal weighting via attention (Paper 2, Section 8).
+//
+// Computes per-signal softmax attention weights from query features:
+// w_i(q) = softmax(W @ features + b)[i], then combines probability
+// signals via weighted log-odds conjunction.  This enables the fusion
+// weights to adapt per-query rather than being fixed across all queries.
+//
+// The class is feature-agnostic -- it learns a linear projection from
+// arbitrary user-provided query features to softmax attention weights.
+export class AttentionLogOddsWeights {
+  private _nSignals: number;
+  private _nQueryFeatures: number;
+  private _alpha: number;
+
+  // W: (nSignals x nQueryFeatures), b: (nSignals,)
+  private _W: number[][];
+  private _b: number[];
+
+  // Online learning state
+  private _nUpdates: number = 0;
+  private _gradWEMA: number[][];
+  private _gradBEMA: number[];
+
+  // Polyak averaging
+  private _WAvg: number[][];
+  private _bAvg: number[];
+
+  constructor(
+    nSignals: number,
+    nQueryFeatures: number,
+    alpha: number | "auto" = 0.5,
+  ) {
+    if (nSignals < 1) {
+      throw new Error(`n_signals must be >= 1, got ${nSignals}`);
+    }
+    if (nQueryFeatures < 1) {
+      throw new Error(
+        `n_query_features must be >= 1, got ${nQueryFeatures}`,
+      );
+    }
+    this._nSignals = nSignals;
+    this._nQueryFeatures = nQueryFeatures;
+    this._alpha = resolveAlpha(alpha, 0.5);
+
+    // Xavier-style initialization scaled for softmax input
+    const scale = 1.0 / Math.sqrt(nQueryFeatures);
+    const rng = mulberry32(0);
+    this._W = [];
+    for (let i = 0; i < nSignals; i++) {
+      const row: number[] = [];
+      for (let j = 0; j < nQueryFeatures; j++) {
+        row.push(randNormal(rng) * scale);
+      }
+      this._W.push(row);
+    }
+    this._b = new Array(nSignals).fill(0);
+
+    // Online learning state
+    this._gradWEMA = [];
+    for (let i = 0; i < nSignals; i++) {
+      this._gradWEMA.push(new Array(nQueryFeatures).fill(0));
+    }
+    this._gradBEMA = new Array(nSignals).fill(0);
+
+    // Polyak averaging
+    this._WAvg = this._W.map((row) => [...row]);
+    this._bAvg = [...this._b];
+  }
+
+  get nSignals(): number {
+    return this._nSignals;
+  }
+
+  get nQueryFeatures(): number {
+    return this._nQueryFeatures;
+  }
+
+  get alpha(): number {
+    return this._alpha;
+  }
+
+  // Weight matrix W of shape (nSignals, nQueryFeatures). Returns a copy.
+  get weightsMatrix(): number[][] {
+    return this._W.map((row) => [...row]);
+  }
+
+  // Compute softmax attention weights from query features.
+  // queryFeatures: array of shape (nQueryFeatures,) or array of arrays (m, nQueryFeatures)
+  private _computeWeights(
+    queryFeatures: number[][],
+    useAveraged: boolean = false,
+  ): number[][] {
+    const W = useAveraged ? this._WAvg : this._W;
+    const b = useAveraged ? this._bAvg : this._b;
+    const n = this._nSignals;
+
+    // z[i] = queryFeatures[i] @ W.T + b  -> (m, nSignals)
+    const z: number[][] = [];
+    for (const qf of queryFeatures) {
+      const row: number[] = [];
+      for (let s = 0; s < n; s++) {
+        let dot = b[s]!;
+        for (let f = 0; f < this._nQueryFeatures; f++) {
+          dot += W[s]![f]! * qf[f]!;
+        }
+        row.push(dot);
+      }
+      z.push(row);
+    }
+
+    return softmax2D(z);
+  }
+
+  // Combine probability signals via query-dependent weighted log-odds.
+  combine(
+    probs: number[],
+    queryFeatures: number[],
+    useAveraged?: boolean,
+  ): number;
+  combine(
+    probs: number[][],
+    queryFeatures: number[][],
+    useAveraged?: boolean,
+  ): number[];
+  combine(
+    probs: number[] | number[][],
+    queryFeatures: number[] | number[][],
+    useAveraged: boolean = false,
+  ): number | number[] {
+    // Ensure 2D
+    const qf2D =
+      typeof queryFeatures[0] === "number"
+        ? [queryFeatures as number[]]
+        : (queryFeatures as number[][]);
+
+    const w = this._computeWeights(qf2D, useAveraged);
+
+    if (!is2D(probs as number[] | number[][])) {
+      // Single sample
+      const wFlat = w[0]!;
+      return logOddsConjunction(probs as number[], this._alpha, wFlat);
+    }
+
+    // Batched: each row has its own query-dependent weights
+    const probsBatch = probs as number[][];
+    const results: number[] = [];
+    for (let i = 0; i < probsBatch.length; i++) {
+      results.push(
+        logOddsConjunction(
+          probsBatch[i]!,
+          this._alpha,
+          w[i]!,
+        ) as number,
+      );
+    }
+    return results;
+  }
+
+  // Batch gradient descent on BCE loss to learn W and b.
+  fit(
+    probs: number[][],
+    labels: number[],
+    queryFeatures: number[][],
+    options: {
+      learningRate?: number;
+      maxIterations?: number;
+      tolerance?: number;
+    } = {},
+  ): void {
+    const {
+      learningRate = 0.01,
+      maxIterations = 1000,
+      tolerance = 1e-6,
+    } = options;
+
+    const m = probs.length;
+    const n = this._nSignals;
+    const scale = n ** this._alpha;
+
+    // Log-odds of input signals: (m, n)
+    const x = probs.map(
+      (row) => logit(clampProbability(row)) as number[],
+    );
+
+    for (let iter = 0; iter < maxIterations; iter++) {
+      // Compute per-sample attention weights
+      // z = queryFeatures @ W.T + b  -> (m, n)
+      const z: number[][] = [];
+      for (let s = 0; s < m; s++) {
+        const row: number[] = [];
+        for (let j = 0; j < n; j++) {
+          let dot = this._b[j]!;
+          for (let f = 0; f < this._nQueryFeatures; f++) {
+            dot += this._W[j]![f]! * queryFeatures[s]![f]!;
+          }
+          row.push(dot);
+        }
+        z.push(row);
+      }
+      const w = softmax2D(z);
+
+      // Weighted log-odds per sample
+      const xBarW: number[] = [];
+      for (let s = 0; s < m; s++) {
+        let sum = 0;
+        for (let j = 0; j < n; j++) {
+          sum += w[s]![j]! * x[s]![j]!;
+        }
+        xBarW.push(sum);
+      }
+
+      // Predicted probability
+      const p = xBarW.map((xb) => sigmoid(scale * xb) as number);
+      const error = p.map((pi, s) => pi - labels[s]!);
+
+      // Gradient: dL/dz_j = scale * (p - y) * w_j * (x_j - x_bar_w)
+      // gradZ: (m, n)
+      const gradZ: number[][] = [];
+      for (let s = 0; s < m; s++) {
+        const row: number[] = [];
+        for (let j = 0; j < n; j++) {
+          row.push(
+            scale * error[s]! * w[s]![j]! * (x[s]![j]! - xBarW[s]!),
+          );
+        }
+        gradZ.push(row);
+      }
+
+      // dL/dW = (1/m) * gradZ.T @ queryFeatures  -> (n, nQueryFeatures)
+      const gradW: number[][] = [];
+      for (let j = 0; j < n; j++) {
+        const row: number[] = [];
+        for (let f = 0; f < this._nQueryFeatures; f++) {
+          let sum = 0;
+          for (let s = 0; s < m; s++) {
+            sum += gradZ[s]![j]! * queryFeatures[s]![f]!;
+          }
+          row.push(sum / m);
+        }
+        gradW.push(row);
+      }
+
+      // gradB = mean(gradZ, axis=0)  -> (n,)
+      const gradB: number[] = new Array(n).fill(0);
+      for (let s = 0; s < m; s++) {
+        for (let j = 0; j < n; j++) {
+          gradB[j]! += gradZ[s]![j]!;
+        }
+      }
+      for (let j = 0; j < n; j++) {
+        gradB[j]! /= m;
+      }
+
+      // Update parameters and check convergence
+      let maxChange = 0;
+      for (let j = 0; j < n; j++) {
+        for (let f = 0; f < this._nQueryFeatures; f++) {
+          const change = learningRate * gradW[j]![f]!;
+          this._W[j]![f]! -= change;
+          if (Math.abs(change) > maxChange) {
+            maxChange = Math.abs(change);
+          }
+        }
+        const bChange = learningRate * gradB[j]!;
+        this._b[j]! -= bChange;
+        if (Math.abs(bChange) > maxChange) {
+          maxChange = Math.abs(bChange);
+        }
+      }
+
+      if (maxChange < tolerance) {
+        break;
+      }
+    }
+
+    // Reset online state after batch fit
+    this._nUpdates = 0;
+    for (let i = 0; i < n; i++) {
+      for (let f = 0; f < this._nQueryFeatures; f++) {
+        this._gradWEMA[i]![f] = 0;
+      }
+    }
+    this._gradBEMA = new Array(n).fill(0);
+    this._WAvg = this._W.map((row) => [...row]);
+    this._bAvg = [...this._b];
+  }
+
+  // Online SGD update from a single observation or mini-batch.
+  update(
+    probs: number[] | number[][],
+    label: number | number[],
+    queryFeatures: number[] | number[][],
+    options: {
+      learningRate?: number;
+      momentum?: number;
+      decayTau?: number;
+      maxGradNorm?: number;
+      avgDecay?: number;
+    } = {},
+  ): void {
+    const {
+      learningRate = 0.01,
+      momentum = 0.9,
+      decayTau = 1000.0,
+      maxGradNorm = 1.0,
+      avgDecay = 0.995,
+    } = options;
+
+    // Normalize to 2D
+    const probsBatch: number[][] = is2D(probs as number[] | number[][])
+      ? (probs as number[][])
+      : [probs as number[]];
+    const labelsBatch: number[] = Array.isArray(label)
+      ? label
+      : [label];
+    const qfBatch: number[][] =
+      typeof queryFeatures[0] === "number"
+        ? [queryFeatures as number[]]
+        : (queryFeatures as number[][]);
+
+    const m = probsBatch.length;
+    const n = this._nSignals;
+    const scale = n ** this._alpha;
+
+    // Log-odds of input signals: (m, n)
+    const x = probsBatch.map(
+      (row) => logit(clampProbability(row)) as number[],
+    );
+
+    // z = qfBatch @ W.T + b  -> (m, n)
+    const z: number[][] = [];
+    for (let s = 0; s < m; s++) {
+      const row: number[] = [];
+      for (let j = 0; j < n; j++) {
+        let dot = this._b[j]!;
+        for (let f = 0; f < this._nQueryFeatures; f++) {
+          dot += this._W[j]![f]! * qfBatch[s]![f]!;
+        }
+        row.push(dot);
+      }
+      z.push(row);
+    }
+    const w = softmax2D(z);
+
+    // Weighted log-odds per sample
+    const xBarW: number[] = [];
+    for (let s = 0; s < m; s++) {
+      let sum = 0;
+      for (let j = 0; j < n; j++) {
+        sum += w[s]![j]! * x[s]![j]!;
+      }
+      xBarW.push(sum);
+    }
+
+    const p = xBarW.map((xb) => sigmoid(scale * xb) as number);
+    const error = p.map((pi, s) => pi - labelsBatch[s]!);
+
+    // gradZ: (m, n)
+    const gradZ: number[][] = [];
+    for (let s = 0; s < m; s++) {
+      const row: number[] = [];
+      for (let j = 0; j < n; j++) {
+        row.push(
+          scale * error[s]! * w[s]![j]! * (x[s]![j]! - xBarW[s]!),
+        );
+      }
+      gradZ.push(row);
+    }
+
+    // dL/dW = (1/m) * gradZ.T @ qfBatch  -> (n, nQueryFeatures)
+    const gradW: number[][] = [];
+    for (let j = 0; j < n; j++) {
+      const row: number[] = [];
+      for (let f = 0; f < this._nQueryFeatures; f++) {
+        let sum = 0;
+        for (let s = 0; s < m; s++) {
+          sum += gradZ[s]![j]! * qfBatch[s]![f]!;
+        }
+        row.push(sum / m);
+      }
+      gradW.push(row);
+    }
+
+    const gradB: number[] = new Array(n).fill(0);
+    for (let s = 0; s < m; s++) {
+      for (let j = 0; j < n; j++) {
+        gradB[j]! += gradZ[s]![j]!;
+      }
+    }
+    for (let j = 0; j < n; j++) {
+      gradB[j]! /= m;
+    }
+
+    // EMA smoothing
+    for (let j = 0; j < n; j++) {
+      for (let f = 0; f < this._nQueryFeatures; f++) {
+        this._gradWEMA[j]![f] =
+          momentum * this._gradWEMA[j]![f]! +
+          (1.0 - momentum) * gradW[j]![f]!;
+      }
+      this._gradBEMA[j] =
+        momentum * this._gradBEMA[j]! + (1.0 - momentum) * gradB[j]!;
+    }
+
+    // Bias correction
+    this._nUpdates += 1;
+    const correction = 1.0 - Math.pow(momentum, this._nUpdates);
+
+    // Corrected gradients
+    const correctedW: number[][] = [];
+    for (let j = 0; j < n; j++) {
+      correctedW.push(
+        this._gradWEMA[j]!.map((g) => g / correction),
+      );
+    }
+    const correctedB = this._gradBEMA.map((g) => g / correction);
+
+    // L2 gradient clipping (joint norm over W and b)
+    let gradNorm = 0;
+    for (let j = 0; j < n; j++) {
+      for (let f = 0; f < this._nQueryFeatures; f++) {
+        gradNorm += correctedW[j]![f]! ** 2;
+      }
+      gradNorm += correctedB[j]! ** 2;
+    }
+    gradNorm = Math.sqrt(gradNorm);
+    if (gradNorm > maxGradNorm) {
+      const clipScale = maxGradNorm / gradNorm;
+      for (let j = 0; j < n; j++) {
+        for (let f = 0; f < this._nQueryFeatures; f++) {
+          correctedW[j]![f]! *= clipScale;
+        }
+        correctedB[j]! *= clipScale;
+      }
+    }
+
+    // Learning rate decay
+    const effectiveLR = learningRate / (1.0 + this._nUpdates / decayTau);
+
+    // Update parameters
+    for (let j = 0; j < n; j++) {
+      for (let f = 0; f < this._nQueryFeatures; f++) {
+        this._W[j]![f]! -= effectiveLR * correctedW[j]![f]!;
+      }
+      this._b[j]! -= effectiveLR * correctedB[j]!;
+    }
+
+    // Polyak averaging
+    for (let j = 0; j < n; j++) {
+      for (let f = 0; f < this._nQueryFeatures; f++) {
+        this._WAvg[j]![f] =
+          avgDecay * this._WAvg[j]![f]! +
+          (1.0 - avgDecay) * this._W[j]![f]!;
+      }
+      this._bAvg[j] =
+        avgDecay * this._bAvg[j]! + (1.0 - avgDecay) * this._b[j]!;
     }
   }
 }

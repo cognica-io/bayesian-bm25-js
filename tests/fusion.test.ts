@@ -13,6 +13,7 @@ import {
   probNot,
   probOr,
   LearnableLogOddsWeights,
+  AttentionLogOddsWeights,
 } from "../src/fusion.js";
 import { logit, sigmoid, clampProbability } from "../src/probability.js";
 
@@ -689,5 +690,373 @@ describe("LearnableLogOddsWeights", () => {
     for (let j = 0; j < n; j++) {
       expect(analyticalGrad[j]!).toBeCloseTo(fdGrad[j]!, 4);
     }
+  });
+
+  it("accepts alpha='auto'", () => {
+    const learner = new LearnableLogOddsWeights(3, "auto");
+    expect(learner.alpha).toBe(0.5);
+  });
+
+  it("alpha='auto' produces valid output", () => {
+    const learner = new LearnableLogOddsWeights(2, "auto");
+    const result = learner.combine([0.8, 0.7]);
+    expect(result).toBeGreaterThan(0);
+    expect(result).toBeLessThan(1);
+  });
+});
+
+describe("alpha auto", () => {
+  it("matches alpha=0.5 in unweighted mode", () => {
+    const probs = [0.8, 0.9];
+    const auto = logOddsConjunction(probs, "auto");
+    const explicit = logOddsConjunction(probs, 0.5);
+    expect(auto).toBeCloseTo(explicit, 12);
+  });
+
+  it("matches alpha=0.5 in weighted mode", () => {
+    const probs = [0.8, 0.9];
+    const w = [0.6, 0.4];
+    const auto = logOddsConjunction(probs, "auto", w);
+    const explicit = logOddsConjunction(probs, 0.5, w);
+    expect(auto).toBeCloseTo(explicit, 12);
+  });
+
+  it("amplifies agreement like alpha=0.5", () => {
+    const probs = [0.9, 0.9];
+    const result = logOddsConjunction(probs, "auto");
+    expect(result).toBeGreaterThan(0.9);
+  });
+
+  it("works with batched inputs", () => {
+    const probs = [
+      [0.9, 0.9],
+      [0.3, 0.3],
+    ];
+    const result = logOddsConjunction(probs, "auto") as number[];
+    expect(result).toHaveLength(2);
+    expect(result[0]!).toBeGreaterThan(0.9);
+    expect(result[1]!).toBeLessThan(0.5);
+  });
+
+  it("invalid alpha string throws", () => {
+    expect(() =>
+      logOddsConjunction([0.5, 0.5], "invalid" as any),
+    ).toThrow("alpha must be");
+  });
+
+  it("alpha=undefined preserves backward compatibility", () => {
+    const probs = [0.8, 0.9];
+    const noneUnweighted = logOddsConjunction(probs, undefined);
+    const halfUnweighted = logOddsConjunction(probs, 0.5);
+    expect(noneUnweighted).toBeCloseTo(halfUnweighted, 12);
+
+    const w = [0.6, 0.4];
+    const noneWeighted = logOddsConjunction(probs, undefined, w);
+    const zeroWeighted = logOddsConjunction(probs, 0.0, w);
+    expect(noneWeighted).toBeCloseTo(zeroWeighted, 12);
+  });
+});
+
+describe("gating", () => {
+  it("none gating is identity", () => {
+    const probs = [0.8, 0.9];
+    const resultNone = logOddsConjunction(probs, undefined, undefined, "none");
+    const resultDefault = logOddsConjunction(probs);
+    expect(resultNone).toBeCloseTo(resultDefault as number, 12);
+  });
+
+  it("relu zeros weak evidence", () => {
+    // 0.3 has logit < 0, so ReLU zeroes it out
+    const probs = [0.9, 0.3];
+    const resultRelu = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "relu",
+    );
+    const resultNone = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "none",
+    );
+    // With ReLU, the 0.3 signal is zeroed: result should be higher
+    expect(resultRelu).toBeGreaterThan(resultNone as number);
+  });
+
+  it("relu on all-above-0.5 is same as no gating", () => {
+    const probs = [0.8, 0.9, 0.7];
+    const resultRelu = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "relu",
+    );
+    const resultNone = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "none",
+    );
+    expect(resultRelu).toBeCloseTo(resultNone as number, 12);
+  });
+
+  it("swish is between none and relu for mixed signals", () => {
+    const probs = [0.9, 0.3];
+    const resultNone = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "none",
+    ) as number;
+    const resultSwish = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "swish",
+    ) as number;
+    const resultRelu = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "relu",
+    ) as number;
+    expect(resultNone).toBeLessThan(resultSwish);
+    expect(resultSwish).toBeLessThan(resultRelu);
+  });
+
+  it("swish with all above 0.5 is close to no gating", () => {
+    const probs = [0.8, 0.9];
+    const resultSwish = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "swish",
+    ) as number;
+    const resultNone = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "none",
+    ) as number;
+    expect(resultSwish).toBeLessThan(resultNone);
+    expect(Math.abs(resultSwish - resultNone)).toBeLessThan(0.06);
+  });
+
+  it("gating works with weights", () => {
+    const probs = [0.9, 0.3];
+    const w = [0.5, 0.5];
+    const resultNone = logOddsConjunction(probs, undefined, w, "none") as number;
+    const resultRelu = logOddsConjunction(probs, undefined, w, "relu") as number;
+    expect(resultRelu).toBeGreaterThan(resultNone);
+  });
+
+  it("gating works with alpha auto", () => {
+    const probs = [0.9, 0.3, 0.8];
+    const result = logOddsConjunction(probs, "auto", undefined, "relu");
+    expect(result).toBeGreaterThan(0);
+    expect(result).toBeLessThan(1);
+  });
+
+  it("invalid gating throws", () => {
+    expect(() =>
+      logOddsConjunction([0.5, 0.5], undefined, undefined, "invalid"),
+    ).toThrow("gating must be");
+  });
+
+  it("relu works with batched inputs", () => {
+    const probs = [
+      [0.9, 0.3],
+      [0.3, 0.9],
+    ];
+    const result = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "relu",
+    ) as number[];
+    expect(result).toHaveLength(2);
+    // Both batches have one signal zeroed out, symmetric
+    expect(result[0]!).toBeCloseTo(result[1]!, 12);
+  });
+
+  it("swish works with batched inputs", () => {
+    const probs = [
+      [0.9, 0.3],
+      [0.8, 0.8],
+    ];
+    const result = logOddsConjunction(
+      probs,
+      undefined,
+      undefined,
+      "swish",
+    ) as number[];
+    expect(result).toHaveLength(2);
+    for (const r of result) {
+      expect(Number.isFinite(r)).toBe(true);
+      expect(r).toBeGreaterThan(0);
+      expect(r).toBeLessThan(1);
+    }
+  });
+});
+
+describe("AttentionLogOddsWeights", () => {
+  it("initializes with correct shapes", () => {
+    const attn = new AttentionLogOddsWeights(3, 5);
+    expect(attn.nSignals).toBe(3);
+    expect(attn.nQueryFeatures).toBe(5);
+    expect(attn.weightsMatrix).toHaveLength(3);
+    expect(attn.weightsMatrix[0]!).toHaveLength(5);
+    expect(attn.alpha).toBe(0.5);
+  });
+
+  it("alpha='auto' resolves to 0.5", () => {
+    const attn = new AttentionLogOddsWeights(2, 3, "auto");
+    expect(attn.alpha).toBe(0.5);
+  });
+
+  it("invalid nSignals throws", () => {
+    expect(() => new AttentionLogOddsWeights(0, 3)).toThrow("n_signals");
+  });
+
+  it("invalid nQueryFeatures throws", () => {
+    expect(() => new AttentionLogOddsWeights(2, 0)).toThrow("n_query_features");
+  });
+
+  it("single sample combine returns number in (0, 1)", () => {
+    const attn = new AttentionLogOddsWeights(2, 3);
+    const result = attn.combine([0.8, 0.7], [1.0, 0.5, -0.3]);
+    expect(typeof result).toBe("number");
+    expect(result).toBeGreaterThan(0);
+    expect(result).toBeLessThan(1);
+  });
+
+  it("batched combine returns array of correct length", () => {
+    const attn = new AttentionLogOddsWeights(2, 3);
+    const result = attn.combine(
+      [
+        [0.8, 0.7],
+        [0.3, 0.9],
+      ],
+      [
+        [1.0, 0.5, -0.3],
+        [0.2, -0.1, 0.8],
+      ],
+    ) as number[];
+    expect(result).toHaveLength(2);
+    for (const r of result) {
+      expect(r).toBeGreaterThan(0);
+      expect(r).toBeLessThan(1);
+    }
+  });
+
+  it("different queries produce different weights", () => {
+    const attn = new AttentionLogOddsWeights(2, 3);
+    const probs = [0.9, 0.3];
+    const r1 = attn.combine(probs, [1.0, 0.0, 0.0]) as number;
+    const r2 = attn.combine(probs, [0.0, 0.0, 1.0]) as number;
+    // With random init, different features should produce different results
+    expect(Math.abs(r1 - r2)).toBeGreaterThan(1e-6);
+  });
+
+  it("fit learns informative features", () => {
+    let seed = 42;
+    const rng = () => {
+      seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+      return (seed >>> 0) / 0x100000000;
+    };
+
+    const m = 300;
+    const labels: number[] = [];
+    const probs: number[][] = [];
+    const qf: number[][] = [];
+
+    for (let i = 0; i < m; i++) {
+      const label = rng() > 0.5 ? 1.0 : 0.0;
+      labels.push(label);
+      // Signal 0: reliable, Signal 1: noisy
+      const s0 = label === 1 ? 0.85 : 0.15;
+      const s1 = 0.3 + rng() * 0.4;
+      probs.push([s0, s1]);
+      // Constant feature favoring signal 0
+      qf.push([1.0, rng() - 0.5, rng() - 0.5]);
+    }
+
+    const attn = new AttentionLogOddsWeights(2, 3, 0.0);
+    attn.fit(probs, labels, qf, {
+      learningRate: 0.1,
+      maxIterations: 2000,
+    });
+
+    const resultHigh = attn.combine(
+      [0.9, 0.5],
+      [1.0, 0.0, 0.0],
+    ) as number;
+    const resultLow = attn.combine(
+      [0.1, 0.5],
+      [1.0, 0.0, 0.0],
+    ) as number;
+    expect(resultHigh).toBeGreaterThan(resultLow);
+  });
+
+  it("update moves parameters", () => {
+    const attn = new AttentionLogOddsWeights(2, 2);
+    const wBefore = attn.weightsMatrix;
+
+    for (let i = 0; i < 50; i++) {
+      attn.update([0.9, 0.1], 1.0, [1.0, 0.0], { learningRate: 0.05 });
+    }
+
+    const wAfter = attn.weightsMatrix;
+    // At least one element should have changed
+    let changed = false;
+    for (let i = 0; i < 2; i++) {
+      for (let j = 0; j < 2; j++) {
+        if (Math.abs(wBefore[i]![j]! - wAfter[i]![j]!) > 1e-6) {
+          changed = true;
+        }
+      }
+    }
+    expect(changed).toBe(true);
+  });
+
+  it("useAveraged uses Polyak-averaged parameters", () => {
+    const attn = new AttentionLogOddsWeights(2, 2, 0.0);
+    const probs = [0.8, 0.7];
+    const qf = [1.0, 0.5];
+
+    // At init, averaged = raw
+    const rRaw = attn.combine(probs, qf, false) as number;
+    const rAvg = attn.combine(probs, qf, true) as number;
+    expect(rRaw).toBeCloseTo(rAvg, 10);
+  });
+
+  it("weightsMatrix returns a copy", () => {
+    const attn = new AttentionLogOddsWeights(2, 3);
+    const w1 = attn.weightsMatrix;
+    const w2 = attn.weightsMatrix;
+    expect(w1).not.toBe(w2);
+    w1[0]![0] = 999.0;
+    expect(attn.weightsMatrix[0]![0]).not.toBe(999.0);
+  });
+
+  it("fit resets online state", () => {
+    const attn = new AttentionLogOddsWeights(2, 2);
+    attn.update([0.8, 0.2], 1.0, [1.0, 0.0]);
+    expect((attn as any)._nUpdates).toBe(1);
+
+    attn.fit(
+      [
+        [0.8, 0.2],
+        [0.3, 0.7],
+      ],
+      [1.0, 0.0],
+      [
+        [1.0, 0.0],
+        [0.0, 1.0],
+      ],
+    );
+
+    expect((attn as any)._nUpdates).toBe(0);
   });
 });
