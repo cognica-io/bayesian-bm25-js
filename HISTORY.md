@@ -1,5 +1,21 @@
 # History
 
+## 0.6.0 (2026-03-05)
+
+- Add `normalize` parameter to `AttentionLogOddsWeights` for per-signal logit normalization
+  - When `normalize=true`, applies per-column min-max normalization in logit space
+    before the weighted sum, equalizing signal scales (same scaling as
+    `balancedLogOddsFusion`)
+  - `combine()`: normalizes logit columns across all candidates for a given query;
+    1D (single sample) falls through to non-normalized path
+  - `fit()`: accepts optional `queryIds` in options to normalize within each query
+    group; without `queryIds`, normalizes the whole batch as a single group
+  - `update()`: normalizes logit columns when input is 2D
+  - Adds `normalize` read-only property and private `_normalizeLogits` static method
+  - Reuses the existing `minMaxNormalize` function for per-column normalization
+- Fix `AttentionLogOddsWeights.combine()` to broadcast single query features across
+  batched probability inputs (single query vector applied to all candidates)
+
 ## 0.5.0 (2026-03-04)
 
 - Add `alpha="auto"` to `logOddsConjunction` for automatic confidence scaling

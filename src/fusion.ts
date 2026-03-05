@@ -627,6 +627,7 @@ export class AttentionLogOddsWeights {
   private _nSignals: number;
   private _nQueryFeatures: number;
   private _alpha: number;
+  private _normalize: boolean;
 
   // W: (nSignals x nQueryFeatures), b: (nSignals,)
   private _W: number[][];
@@ -645,6 +646,7 @@ export class AttentionLogOddsWeights {
     nSignals: number,
     nQueryFeatures: number,
     alpha: number | "auto" = 0.5,
+    normalize: boolean = false,
   ) {
     if (nSignals < 1) {
       throw new Error(`n_signals must be >= 1, got ${nSignals}`);
@@ -657,6 +659,7 @@ export class AttentionLogOddsWeights {
     this._nSignals = nSignals;
     this._nQueryFeatures = nQueryFeatures;
     this._alpha = resolveAlpha(alpha, 0.5);
+    this._normalize = normalize;
 
     // Xavier-style initialization scaled for softmax input
     const scale = 1.0 / Math.sqrt(nQueryFeatures);
@@ -693,6 +696,27 @@ export class AttentionLogOddsWeights {
 
   get alpha(): number {
     return this._alpha;
+  }
+
+  // Whether per-signal logit normalization is enabled.
+  get normalize(): boolean {
+    return this._normalize;
+  }
+
+  // Per-column min-max normalization on logit array.
+  // Each column (signal) is independently normalized to [0, 1].
+  private static _normalizeLogits(x: number[][]): number[][] {
+    if (x.length === 0) return [];
+    const nCols = x[0]!.length;
+    const result = x.map((row) => [...row]);
+    for (let col = 0; col < nCols; col++) {
+      const column = result.map((row) => row[col]!);
+      const normalized = minMaxNormalize(column);
+      for (let row = 0; row < result.length; row++) {
+        result[row]![col] = normalized[row]!;
+      }
+    }
+    return result;
   }
 
   // Weight matrix W of shape (nSignals, nQueryFeatures). Returns a copy.
@@ -752,20 +776,44 @@ export class AttentionLogOddsWeights {
     const w = this._computeWeights(qf2D, useAveraged);
 
     if (!is2D(probs as number[] | number[][])) {
-      // Single sample
+      // Single sample: normalization cannot apply (no candidates to
+      // normalize across), fall through to original path.
       const wFlat = w[0]!;
       return logOddsConjunction(probs as number[], this._alpha, wFlat);
     }
 
-    // Batched: each row has its own query-dependent weights
     const probsBatch = probs as number[][];
+
+    if (this._normalize) {
+      // Normalize logits per-signal column, then weighted sum + sigmoid
+      const x = AttentionLogOddsWeights._normalizeLogits(
+        probsBatch.map((row) => logit(clampProbability(row)) as number[]),
+      );
+      const n = this._nSignals;
+      const scale = n ** this._alpha;
+      const results: number[] = [];
+      for (let i = 0; i < x.length; i++) {
+        const wi = w[Math.min(i, w.length - 1)]!;
+        let weightedSum = 0;
+        for (let j = 0; j < n; j++) {
+          weightedSum += wi[j]! * x[i]![j]!;
+        }
+        results.push(sigmoid(scale * weightedSum) as number);
+      }
+      return results;
+    }
+
+    // Batched: each row has its own query-dependent weights.
+    // When w has fewer rows than probs (single query features for all
+    // candidates), broadcast by repeating the single weight vector.
     const results: number[] = [];
     for (let i = 0; i < probsBatch.length; i++) {
+      const wi = w[Math.min(i, w.length - 1)]!;
       results.push(
         logOddsConjunction(
           probsBatch[i]!,
           this._alpha,
-          w[i]!,
+          wi,
         ) as number,
       );
     }
@@ -773,17 +821,24 @@ export class AttentionLogOddsWeights {
   }
 
   // Batch gradient descent on BCE loss to learn W and b.
+  //
+  // queryIds: optional query group identifiers for per-query normalization.
+  // When normalize=true and queryIds is provided, logit normalization is
+  // applied within each query group. When normalize=true and queryIds is
+  // null, the whole batch is normalized as a single group.
   fit(
     probs: number[][],
     labels: number[],
     queryFeatures: number[][],
     options: {
+      queryIds?: number[];
       learningRate?: number;
       maxIterations?: number;
       tolerance?: number;
     } = {},
   ): void {
     const {
+      queryIds,
       learningRate = 0.01,
       maxIterations = 1000,
       tolerance = 1e-6,
@@ -794,9 +849,29 @@ export class AttentionLogOddsWeights {
     const scale = n ** this._alpha;
 
     // Log-odds of input signals: (m, n)
-    const x = probs.map(
+    let x = probs.map(
       (row) => logit(clampProbability(row)) as number[],
     );
+
+    if (this._normalize) {
+      if (queryIds !== undefined) {
+        // Per-query normalization
+        const uniqueIds = [...new Set(queryIds)];
+        for (const qid of uniqueIds) {
+          const indices: number[] = [];
+          for (let i = 0; i < queryIds.length; i++) {
+            if (queryIds[i] === qid) indices.push(i);
+          }
+          const group = indices.map((i) => x[i]!);
+          const normalized = AttentionLogOddsWeights._normalizeLogits(group);
+          for (let k = 0; k < indices.length; k++) {
+            x[indices[k]!] = normalized[k]!;
+          }
+        }
+      } else {
+        x = AttentionLogOddsWeights._normalizeLogits(x);
+      }
+    }
 
     for (let iter = 0; iter < maxIterations; iter++) {
       // Compute per-sample attention weights
@@ -939,9 +1014,13 @@ export class AttentionLogOddsWeights {
     const scale = n ** this._alpha;
 
     // Log-odds of input signals: (m, n)
-    const x = probsBatch.map(
+    let x = probsBatch.map(
       (row) => logit(clampProbability(row)) as number[],
     );
+
+    if (this._normalize && x.length > 0 && Array.isArray(x[0])) {
+      x = AttentionLogOddsWeights._normalizeLogits(x);
+    }
 
     // z = qfBatch @ W.T + b  -> (m, n)
     const z: number[][] = [];

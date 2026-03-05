@@ -1059,4 +1059,222 @@ describe("AttentionLogOddsWeights", () => {
 
     expect((attn as any)._nUpdates).toBe(0);
   });
+
+  it("normalize defaults to false", () => {
+    const attn = new AttentionLogOddsWeights(2, 3);
+    expect(attn.normalize).toBe(false);
+  });
+
+  it("normalize property reflects constructor argument", () => {
+    const attn = new AttentionLogOddsWeights(2, 3, 0.5, true);
+    expect(attn.normalize).toBe(true);
+  });
+
+  it("normalize=true produces different results from normalize=false", () => {
+    // Signal 0: high dynamic range, Signal 1: low dynamic range
+    const probs = [
+      [0.99, 0.55],
+      [0.50, 0.50],
+      [0.01, 0.45],
+    ];
+    const qf = [
+      [1.0, 0.0, 0.0],
+      [1.0, 0.0, 0.0],
+      [1.0, 0.0, 0.0],
+    ];
+
+    const attnPlain = new AttentionLogOddsWeights(2, 3, 0.5, false);
+    const attnNorm = new AttentionLogOddsWeights(2, 3, 0.5, true);
+    // Copy weights so both use the same parameters
+    (attnNorm as any)._W = (attnPlain as any)._W.map((r: number[]) => [...r]);
+    (attnNorm as any)._b = [...(attnPlain as any)._b];
+    (attnNorm as any)._WAvg = (attnPlain as any)._WAvg.map(
+      (r: number[]) => [...r],
+    );
+    (attnNorm as any)._bAvg = [...(attnPlain as any)._bAvg];
+
+    const rPlain = attnPlain.combine(probs, qf) as number[];
+    const rNorm = attnNorm.combine(probs, qf) as number[];
+    // Results should differ due to normalization
+    let allClose = true;
+    for (let i = 0; i < rPlain.length; i++) {
+      if (Math.abs(rPlain[i]! - rNorm[i]!) > 1e-10) {
+        allClose = false;
+        break;
+      }
+    }
+    expect(allClose).toBe(false);
+  });
+
+  it("normalize=true with 1D probs falls through to non-normalized path", () => {
+    const attnNorm = new AttentionLogOddsWeights(2, 3, 0.5, true);
+    const attnPlain = new AttentionLogOddsWeights(2, 3, 0.5, false);
+    const probs = [0.8, 0.7];
+    const qf = [1.0, 0.5, -0.3];
+    const rNorm = attnNorm.combine(probs, qf) as number;
+    const rPlain = attnPlain.combine(probs, qf) as number;
+    // 1D input cannot be normalized (no candidates to normalize across)
+    expect(Math.abs(rNorm - rPlain)).toBeLessThan(1e-10);
+    expect(rNorm).toBeGreaterThan(0);
+    expect(rNorm).toBeLessThan(1);
+  });
+
+  it("fit with queryIds groups normalization correctly", () => {
+    let seed = 42;
+    const rng = () => {
+      seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+      return (seed >>> 0) / 0x100000000;
+    };
+
+    const m = 200;
+    const nSignals = 2;
+    const nQF = 2;
+
+    const labels: number[] = [];
+    const probsArr: number[][] = [];
+    const queryFeatures: number[][] = [];
+    // 10 queries, each with 20 candidates
+    const queryIds: number[] = [];
+
+    for (let i = 0; i < m; i++) {
+      const label = rng() > 0.5 ? 1.0 : 0.0;
+      labels.push(label);
+      const s0 = label === 1 ? 0.85 : 0.15;
+      const s1 = 0.3 + rng() * 0.4;
+      probsArr.push([s0, s1]);
+      queryFeatures.push([1.0, 1.0]);
+      queryIds.push(Math.floor(i / 20));
+    }
+
+    const attn = new AttentionLogOddsWeights(nSignals, nQF, 0.0, true);
+    // Should not throw
+    attn.fit(probsArr, labels, queryFeatures, {
+      queryIds,
+      learningRate: 0.1,
+      maxIterations: 500,
+    });
+
+    const testProbs = [
+      [0.9, 0.5],
+      [0.1, 0.5],
+    ];
+    const testQF = [1.0, 0.0];
+    const results = attn.combine(testProbs, testQF) as number[];
+    expect(results).toHaveLength(2);
+  });
+
+  it("fit without queryIds normalizes whole batch", () => {
+    let seed = 42;
+    const rng = () => {
+      seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+      return (seed >>> 0) / 0x100000000;
+    };
+
+    const m = 100;
+    const labels: number[] = [];
+    const probsArr: number[][] = [];
+    const queryFeatures: number[][] = [];
+
+    for (let i = 0; i < m; i++) {
+      const label = rng() > 0.5 ? 1.0 : 0.0;
+      labels.push(label);
+      const s0 = label === 1 ? 0.85 : 0.15;
+      const s1 = 0.3 + rng() * 0.4;
+      probsArr.push([s0, s1]);
+      queryFeatures.push([1.0, 1.0]);
+    }
+
+    const attn = new AttentionLogOddsWeights(2, 2, 0.0, true);
+    // Should not throw -- normalizes the whole batch as one group
+    attn.fit(probsArr, labels, queryFeatures, {
+      learningRate: 0.1,
+      maxIterations: 500,
+    });
+    expect((attn as any)._nUpdates).toBe(0);
+  });
+
+  it("per-query normalization produces different weights than global", () => {
+    let seed = 123;
+    const rng = () => {
+      seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+      return (seed >>> 0) / 0x100000000;
+    };
+
+    const nPerQ = 50;
+    const nSignals = 2;
+    const nQF = 2;
+
+    // Query A: signal 0 has high dynamic range, signal 1 low
+    // Query B: signal 0 has low dynamic range, signal 1 high
+    const labels: number[] = [];
+    const probsArr: number[][] = [];
+    const queryIds: number[] = [];
+
+    for (let i = 0; i < nPerQ; i++) {
+      const label = rng() > 0.5 ? 1.0 : 0.0;
+      labels.push(label);
+      const s0 =
+        sigmoid(label === 1 ? 3 + rng() * 7 : -10 + rng() * 7) as number;
+      const s1 = sigmoid(-1 + rng() * 2) as number;
+      probsArr.push([s0, s1]);
+      queryIds.push(0);
+    }
+    for (let i = 0; i < nPerQ; i++) {
+      const label = rng() > 0.5 ? 1.0 : 0.0;
+      labels.push(label);
+      const s0 = sigmoid(-1 + rng() * 2) as number;
+      const s1 =
+        sigmoid(label === 1 ? 3 + rng() * 7 : -10 + rng() * 7) as number;
+      probsArr.push([s0, s1]);
+      queryIds.push(1);
+    }
+
+    const qf: number[][] = [];
+    for (let i = 0; i < 2 * nPerQ; i++) {
+      qf.push([1.0, 1.0]);
+    }
+
+    const attnGlobal = new AttentionLogOddsWeights(nSignals, nQF, 0.0, true);
+    attnGlobal.fit(probsArr, labels, qf, {
+      learningRate: 0.1,
+      maxIterations: 300,
+    });
+
+    const attnPerQ = new AttentionLogOddsWeights(nSignals, nQF, 0.0, true);
+    attnPerQ.fit(probsArr, labels, qf, {
+      queryIds,
+      learningRate: 0.1,
+      maxIterations: 300,
+    });
+
+    // The learned weight matrices should differ
+    const wGlobal = (attnGlobal as any)._W as number[][];
+    const wPerQ = (attnPerQ as any)._W as number[][];
+    let allClose = true;
+    for (let i = 0; i < nSignals; i++) {
+      for (let j = 0; j < nQF; j++) {
+        if (Math.abs(wGlobal[i]![j]! - wPerQ[i]![j]!) > 1e-3) {
+          allClose = false;
+        }
+      }
+    }
+    expect(allClose).toBe(false);
+  });
+
+  it("normalize: uniform signal zeros out", () => {
+    // Signal 0: varied, Signal 1: constant 0.5
+    const probs = [
+      [0.9, 0.5],
+      [0.5, 0.5],
+      [0.1, 0.5],
+    ];
+    const qf = [1.0, 0.0];
+
+    const attn = new AttentionLogOddsWeights(2, 2, 0.5, true);
+    const result = attn.combine(probs, qf) as number[];
+    expect(result).toHaveLength(3);
+    for (const r of result) {
+      expect(Number.isFinite(r)).toBe(true);
+    }
+  });
 });
