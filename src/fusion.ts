@@ -122,8 +122,17 @@ export function resolveAlpha(
 // - "relu": MAP estimate under sparse prior (Theorem 6.5.3).
 //   Zeroes out weak/negative evidence: max(0, logit).
 // - "swish": Bayes estimate under sparse prior (Theorem 6.7.4).
-//   Soft gating: logit * sigmoid(logit).
-function applyGating(logitValues: number[], gating: string): number[] {
+//   Soft gating: logit * sigmoid(beta * logit). When beta=1.0
+//   this is the standard swish (Theorem 6.7.6).
+// - "gelu": Bayesian expected signal under Gaussian noise model
+//   (Theorem 6.8.1, Proposition 6.8.2).  Approximated as
+//   logit * sigmoid(1.702 * logit), which matches Swish_1.702.
+//   The beta parameter is ignored for gelu.
+function applyGating(
+  logitValues: number[],
+  gating: string,
+  beta: number = 1.0,
+): number[] {
   if (gating === "none") {
     return logitValues;
   }
@@ -131,10 +140,13 @@ function applyGating(logitValues: number[], gating: string): number[] {
     return logitValues.map((l) => Math.max(0.0, l));
   }
   if (gating === "swish") {
-    return logitValues.map((l) => l * (sigmoid(l) as number));
+    return logitValues.map((l) => l * (sigmoid(beta * l) as number));
+  }
+  if (gating === "gelu") {
+    return logitValues.map((l) => l * (sigmoid(1.702 * l) as number));
   }
   throw new Error(
-    `gating must be "none", "relu", or "swish", got "${gating}"`,
+    `gating must be "none", "relu", "swish", or "gelu", got "${gating}"`,
   );
 }
 
@@ -142,13 +154,14 @@ function logOddsConjunctionSingle(
   probs: number[],
   alpha: number,
   gating: string,
+  gatingBeta: number,
 ): number {
   const clamped = clampProbability(probs);
   const n = clamped.length;
 
   // Step 1: mean log-odds (Eq. 20)
   const rawLogits = logit(clamped) as number[];
-  const gatedLogits = applyGating(rawLogits, gating);
+  const gatedLogits = applyGating(rawLogits, gating, gatingBeta);
   let logitSum = 0;
   for (const l of gatedLogits) {
     logitSum += l;
@@ -167,11 +180,12 @@ function logOddsWeightedSingle(
   weights: number[],
   alpha: number,
   gating: string,
+  gatingBeta: number,
 ): number {
   const clamped = clampProbability(probs);
   const n = clamped.length;
   const rawLogits = logit(clamped) as number[];
-  const gatedLogits = applyGating(rawLogits, gating);
+  const gatedLogits = applyGating(rawLogits, gating, gatingBeta);
   let weightedSum = 0;
   for (let i = 0; i < gatedLogits.length; i++) {
     weightedSum += weights[i]! * gatedLogits[i]!;
@@ -203,18 +217,21 @@ export function logOddsConjunction(
   alpha?: number | "auto",
   weights?: number[],
   gating?: string,
+  gatingBeta?: number,
 ): number;
 export function logOddsConjunction(
   probs: number[][],
   alpha?: number | "auto",
   weights?: number[],
   gating?: string,
+  gatingBeta?: number,
 ): number[];
 export function logOddsConjunction(
   probs: number[] | number[][],
   alpha?: number | "auto",
   weights?: number[],
   gating: string = "none",
+  gatingBeta: number = 1.0,
 ): number | number[] {
   if (probs.length === 0) return 0;
 
@@ -236,7 +253,7 @@ export function logOddsConjunction(
 
     if (is2D(probs)) {
       return probs.map((row) =>
-        logOddsWeightedSingle(row, weights, effectiveAlpha, gating),
+        logOddsWeightedSingle(row, weights, effectiveAlpha, gating, gatingBeta),
       );
     }
     return logOddsWeightedSingle(
@@ -244,6 +261,7 @@ export function logOddsConjunction(
       weights,
       effectiveAlpha,
       gating,
+      gatingBeta,
     );
   }
 
@@ -251,13 +269,14 @@ export function logOddsConjunction(
 
   if (is2D(probs)) {
     return probs.map((row) =>
-      logOddsConjunctionSingle(row, effectiveAlpha, gating),
+      logOddsConjunctionSingle(row, effectiveAlpha, gating, gatingBeta),
     );
   }
   return logOddsConjunctionSingle(
     probs as number[],
     effectiveAlpha,
     gating,
+    gatingBeta,
   );
 }
 
@@ -335,17 +354,29 @@ function softmax(z: number[]): number[] {
 export class LearnableLogOddsWeights {
   private _nSignals: number;
   private _alpha: number;
+  private _baseRate: number | null;
+  private _logitBaseRate: number | null;
   private _logits: number[];
   private _nUpdates: number = 0;
   private _gradLogitsEMA: number[];
   private _weightsAvg: number[];
 
-  constructor(nSignals: number, alpha: number | "auto" = 0.0) {
+  constructor(
+    nSignals: number,
+    alpha: number | "auto" = 0.0,
+    baseRate: number | null = null,
+  ) {
     if (nSignals < 1) {
       throw new Error(`n_signals must be >= 1, got ${nSignals}`);
     }
+    if (baseRate !== null && (baseRate <= 0.0 || baseRate >= 1.0)) {
+      throw new Error(`base_rate must be in (0, 1), got ${baseRate}`);
+    }
     this._nSignals = nSignals;
     this._alpha = resolveAlpha(alpha, 0.0);
+    this._baseRate = baseRate;
+    this._logitBaseRate =
+      baseRate !== null ? (logit(baseRate) as number) : null;
 
     // Softmax parameterization: zeros -> uniform 1/n (Naive Bayes init)
     this._logits = new Array(nSignals).fill(0);
@@ -359,6 +390,11 @@ export class LearnableLogOddsWeights {
 
   get alpha(): number {
     return this._alpha;
+  }
+
+  // Corpus-level base rate of relevance, or null if not set.
+  get baseRate(): number | null {
+    return this._baseRate;
   }
 
   // Current weights: softmax of internal logits.
@@ -379,7 +415,42 @@ export class LearnableLogOddsWeights {
     useAveraged: boolean = false,
   ): number | number[] {
     const w = useAveraged ? this._weightsAvg : this.weights;
-    return logOddsConjunction(probs as number[], this._alpha, w);
+
+    if (this._logitBaseRate === null) {
+      return logOddsConjunction(probs as number[], this._alpha, w);
+    }
+
+    // With base rate: compute weighted log-odds manually, add logit(baseRate)
+    const n = this._nSignals;
+    const scale = n ** this._alpha;
+    const logitBR = this._logitBaseRate;
+
+    if (is2D(probs as number[] | number[][])) {
+      const probsBatch = probs as number[][];
+      const results: number[] = [];
+      for (const row of probsBatch) {
+        const clamped = clampProbability(row);
+        const x = logit(clamped) as number[];
+        let weightedSum = 0;
+        for (let j = 0; j < n; j++) {
+          weightedSum += w[j]! * x[j]!;
+        }
+        let lWeighted = scale * weightedSum;
+        lWeighted += logitBR;
+        results.push(sigmoid(lWeighted) as number);
+      }
+      return results;
+    }
+
+    const clamped = clampProbability(probs as number[]);
+    const x = logit(clamped) as number[];
+    let weightedSum = 0;
+    for (let j = 0; j < n; j++) {
+      weightedSum += w[j]! * x[j]!;
+    }
+    let lWeighted = scale * weightedSum;
+    lWeighted += logitBR;
+    return sigmoid(lWeighted) as number;
   }
 
   // Batch gradient descent on BCE loss to learn weights.
@@ -434,7 +505,11 @@ export class LearnableLogOddsWeights {
         }
 
         // Predicted probability
-        const p = sigmoid(scale * xBarW) as number;
+        let lWeighted = scale * xBarW;
+        if (this._logitBaseRate !== null) {
+          lWeighted += this._logitBaseRate;
+        }
+        const p = sigmoid(lWeighted) as number;
         const error = p - labels[s]!;
 
         // Accumulate gradient
@@ -528,7 +603,11 @@ export class LearnableLogOddsWeights {
       for (let j = 0; j < n; j++) {
         xBarW += w[j]! * x[s]![j]!;
       }
-      const p = sigmoid(scale * xBarW) as number;
+      let lWeighted = scale * xBarW;
+      if (this._logitBaseRate !== null) {
+        lWeighted += this._logitBaseRate;
+      }
+      const p = sigmoid(lWeighted) as number;
       const error = p - labelsBatch[s]!;
 
       for (let j = 0; j < n; j++) {
@@ -628,6 +707,8 @@ export class AttentionLogOddsWeights {
   private _nQueryFeatures: number;
   private _alpha: number;
   private _normalize: boolean;
+  private _baseRate: number | null;
+  private _logitBaseRate: number | null;
 
   // W: (nSignals x nQueryFeatures), b: (nSignals,)
   private _W: number[][];
@@ -647,6 +728,8 @@ export class AttentionLogOddsWeights {
     nQueryFeatures: number,
     alpha: number | "auto" = 0.5,
     normalize: boolean = false,
+    seed: number = 0,
+    baseRate: number | null = null,
   ) {
     if (nSignals < 1) {
       throw new Error(`n_signals must be >= 1, got ${nSignals}`);
@@ -656,14 +739,20 @@ export class AttentionLogOddsWeights {
         `n_query_features must be >= 1, got ${nQueryFeatures}`,
       );
     }
+    if (baseRate !== null && (baseRate <= 0.0 || baseRate >= 1.0)) {
+      throw new Error(`base_rate must be in (0, 1), got ${baseRate}`);
+    }
     this._nSignals = nSignals;
     this._nQueryFeatures = nQueryFeatures;
     this._alpha = resolveAlpha(alpha, 0.5);
     this._normalize = normalize;
+    this._baseRate = baseRate;
+    this._logitBaseRate =
+      baseRate !== null ? (logit(baseRate) as number) : null;
 
     // Xavier-style initialization scaled for softmax input
     const scale = 1.0 / Math.sqrt(nQueryFeatures);
-    const rng = mulberry32(0);
+    const rng = mulberry32(seed);
     this._W = [];
     for (let i = 0; i < nSignals; i++) {
       const row: number[] = [];
@@ -696,6 +785,11 @@ export class AttentionLogOddsWeights {
 
   get alpha(): number {
     return this._alpha;
+  }
+
+  // Corpus-level base rate of relevance, or null if not set.
+  get baseRate(): number | null {
+    return this._baseRate;
   }
 
   // Whether per-signal logit normalization is enabled.
@@ -777,45 +871,45 @@ export class AttentionLogOddsWeights {
 
     if (!is2D(probs as number[] | number[][])) {
       // Single sample: normalization cannot apply (no candidates to
-      // normalize across), fall through to original path.
+      // normalize across), fall through to direct computation.
       const wFlat = w[0]!;
-      return logOddsConjunction(probs as number[], this._alpha, wFlat);
+      const xSingle = logit(clampProbability(probs as number[])) as number[];
+      const n = this._nSignals;
+      const scale = n ** this._alpha;
+      let weightedSum = 0;
+      for (let j = 0; j < n; j++) {
+        weightedSum += wFlat[j]! * xSingle[j]!;
+      }
+      let lWeighted = scale * weightedSum;
+      if (this._logitBaseRate !== null) {
+        lWeighted += this._logitBaseRate;
+      }
+      return sigmoid(lWeighted) as number;
     }
 
     const probsBatch = probs as number[][];
+    let x = probsBatch.map(
+      (row) => logit(clampProbability(row)) as number[],
+    );
 
     if (this._normalize) {
-      // Normalize logits per-signal column, then weighted sum + sigmoid
-      const x = AttentionLogOddsWeights._normalizeLogits(
-        probsBatch.map((row) => logit(clampProbability(row)) as number[]),
-      );
-      const n = this._nSignals;
-      const scale = n ** this._alpha;
-      const results: number[] = [];
-      for (let i = 0; i < x.length; i++) {
-        const wi = w[Math.min(i, w.length - 1)]!;
-        let weightedSum = 0;
-        for (let j = 0; j < n; j++) {
-          weightedSum += wi[j]! * x[i]![j]!;
-        }
-        results.push(sigmoid(scale * weightedSum) as number);
-      }
-      return results;
+      x = AttentionLogOddsWeights._normalizeLogits(x);
     }
 
-    // Batched: each row has its own query-dependent weights.
-    // When w has fewer rows than probs (single query features for all
-    // candidates), broadcast by repeating the single weight vector.
+    const n = this._nSignals;
+    const scale = n ** this._alpha;
     const results: number[] = [];
-    for (let i = 0; i < probsBatch.length; i++) {
+    for (let i = 0; i < x.length; i++) {
       const wi = w[Math.min(i, w.length - 1)]!;
-      results.push(
-        logOddsConjunction(
-          probsBatch[i]!,
-          this._alpha,
-          wi,
-        ) as number,
-      );
+      let weightedSum = 0;
+      for (let j = 0; j < n; j++) {
+        weightedSum += wi[j]! * x[i]![j]!;
+      }
+      let lWeighted = scale * weightedSum;
+      if (this._logitBaseRate !== null) {
+        lWeighted += this._logitBaseRate;
+      }
+      results.push(sigmoid(lWeighted) as number);
     }
     return results;
   }
@@ -901,7 +995,13 @@ export class AttentionLogOddsWeights {
       }
 
       // Predicted probability
-      const p = xBarW.map((xb) => sigmoid(scale * xb) as number);
+      const p = xBarW.map((xb) => {
+        let lw = scale * xb;
+        if (this._logitBaseRate !== null) {
+          lw += this._logitBaseRate;
+        }
+        return sigmoid(lw) as number;
+      });
       const error = p.map((pi, s) => pi - labels[s]!);
 
       // Gradient: dL/dz_j = scale * (p - y) * w_j * (x_j - x_bar_w)
@@ -1047,7 +1147,13 @@ export class AttentionLogOddsWeights {
       xBarW.push(sum);
     }
 
-    const p = xBarW.map((xb) => sigmoid(scale * xb) as number);
+    const p = xBarW.map((xb) => {
+      let lw = scale * xb;
+      if (this._logitBaseRate !== null) {
+        lw += this._logitBaseRate;
+      }
+      return sigmoid(lw) as number;
+    });
     const error = p.map((pi, s) => pi - labelsBatch[s]!);
 
     // gradZ: (m, n)
@@ -1150,5 +1256,321 @@ export class AttentionLogOddsWeights {
       this._bAvg[j] =
         avgDecay * this._bAvg[j]! + (1.0 - avgDecay) * this._b[j]!;
     }
+  }
+
+  // Compute fused probability upper bounds (Theorem 8.7.1).
+  //
+  // Given per-signal probability upper bounds, compute the maximum
+  // possible fused probability for each candidate.
+  computeUpperBounds(
+    upperBoundProbs: number[][],
+    queryFeatures: number[] | number[][],
+    useAveraged: boolean = false,
+  ): number[] {
+    // Ensure 2D
+    const qf2D =
+      typeof queryFeatures[0] === "number"
+        ? [queryFeatures as number[]]
+        : (queryFeatures as number[][]);
+
+    const ubClamped = upperBoundProbs.map((row) => clampProbability(row));
+
+    const w = this._computeWeights(qf2D, useAveraged);
+    let x = ubClamped.map(
+      (row) => logit(row) as number[],
+    );
+    if (this._normalize) {
+      x = AttentionLogOddsWeights._normalizeLogits(x);
+    }
+    const n = this._nSignals;
+    const scale = n ** this._alpha;
+    const results: number[] = [];
+    for (let i = 0; i < x.length; i++) {
+      const wi = w[Math.min(i, w.length - 1)]!;
+      let weightedSum = 0;
+      for (let j = 0; j < n; j++) {
+        weightedSum += wi[j]! * x[i]![j]!;
+      }
+      let lWeighted = scale * weightedSum;
+      if (this._logitBaseRate !== null) {
+        lWeighted += this._logitBaseRate;
+      }
+      results.push(sigmoid(lWeighted) as number);
+    }
+    return results;
+  }
+
+  // Prune candidates whose upper bound is below threshold (Theorem 8.7.1).
+  //
+  // Returns surviving indices and their fused probabilities.
+  prune(
+    probs: number[][],
+    queryFeatures: number[] | number[][],
+    threshold: number,
+    upperBoundProbs?: number[][],
+    useAveraged: boolean = false,
+  ): { survivingIndices: number[]; fusedProbabilities: number[] } {
+    const ubProbs = upperBoundProbs !== undefined ? upperBoundProbs : probs;
+    const upperBounds = this.computeUpperBounds(
+      ubProbs,
+      queryFeatures,
+      useAveraged,
+    );
+
+    const survivingIndices: number[] = [];
+    for (let i = 0; i < upperBounds.length; i++) {
+      if (upperBounds[i]! >= threshold) {
+        survivingIndices.push(i);
+      }
+    }
+
+    if (survivingIndices.length === 0) {
+      return { survivingIndices: [], fusedProbabilities: [] };
+    }
+
+    // Ensure 2D query features
+    const qf2D =
+      typeof queryFeatures[0] === "number"
+        ? [queryFeatures as number[]]
+        : (queryFeatures as number[][]);
+
+    const survProbs = survivingIndices.map((i) => probs[i]!);
+    const survQF =
+      qf2D.length > 1
+        ? survivingIndices.map((i) => qf2D[i]!)
+        : qf2D;
+
+    const fusedProbabilities = this.combine(
+      survProbs,
+      survQF,
+      useAveraged,
+    ) as number[];
+
+    return { survivingIndices, fusedProbabilities };
+  }
+}
+
+// Multi-head attention fusion (Paper 2, Remark 8.6, Corollary 8.7.2).
+//
+// Creates multiple independent AttentionLogOddsWeights heads, each
+// initialized with a different random seed.  At inference time, each
+// head produces fused log-odds independently, and the results are
+// combined by averaging log-odds across heads before converting back
+// to probability via sigmoid.
+export class MultiHeadAttentionLogOddsWeights {
+  private _nHeads: number;
+  private _heads: AttentionLogOddsWeights[];
+
+  constructor(
+    nHeads: number,
+    nSignals: number,
+    nQueryFeatures: number,
+    alpha: number | "auto" = 0.5,
+    normalize: boolean = false,
+  ) {
+    if (nHeads < 1) {
+      throw new Error(`n_heads must be >= 1, got ${nHeads}`);
+    }
+    this._nHeads = nHeads;
+    this._heads = [];
+    for (let h = 0; h < nHeads; h++) {
+      this._heads.push(
+        new AttentionLogOddsWeights(
+          nSignals,
+          nQueryFeatures,
+          alpha,
+          normalize,
+          h,
+        ),
+      );
+    }
+  }
+
+  get nHeads(): number {
+    return this._nHeads;
+  }
+
+  get heads(): AttentionLogOddsWeights[] {
+    return [...this._heads];
+  }
+
+  // Combine probability signals via multi-head attention fusion.
+  //
+  // Each head produces fused log-odds independently.  The final
+  // result averages the log-odds across heads and applies sigmoid.
+  combine(
+    probs: number[],
+    queryFeatures: number[],
+    useAveraged?: boolean,
+  ): number;
+  combine(
+    probs: number[][],
+    queryFeatures: number[] | number[][],
+    useAveraged?: boolean,
+  ): number[];
+  combine(
+    probs: number[] | number[][],
+    queryFeatures: number[] | number[][],
+    useAveraged: boolean = false,
+  ): number | number[] {
+    const isSingleSample = !is2D(probs as number[] | number[][]);
+
+    const headResults: number[][] = [];
+    for (const head of this._heads) {
+      let r: number | number[];
+      if (isSingleSample) {
+        r = head.combine(
+          probs as number[],
+          queryFeatures as number[],
+          useAveraged,
+        );
+        headResults.push([r]);
+      } else {
+        r = head.combine(
+          probs as number[][],
+          queryFeatures as number[][],
+          useAveraged,
+        );
+        headResults.push(r as number[]);
+      }
+    }
+
+    // Average in log-odds space, then sigmoid
+    const nSamples = headResults[0]!.length;
+    const avgLogits: number[] = [];
+    for (let i = 0; i < nSamples; i++) {
+      let sum = 0;
+      for (let h = 0; h < this._nHeads; h++) {
+        const clamped = clampProbability(headResults[h]![i]!) as number;
+        sum += logit(clamped) as number;
+      }
+      avgLogits.push(sum / this._nHeads);
+    }
+
+    const result = avgLogits.map((l) => sigmoid(l) as number);
+
+    if (isSingleSample) {
+      return result[0]!;
+    }
+    return result;
+  }
+
+  // Train all heads on the same data.
+  //
+  // Different random initializations lead to different learned
+  // solutions, providing diversity across heads.
+  fit(
+    probs: number[][],
+    labels: number[],
+    queryFeatures: number[][],
+    options: {
+      queryIds?: number[];
+      learningRate?: number;
+      maxIterations?: number;
+      tolerance?: number;
+    } = {},
+  ): void {
+    for (const head of this._heads) {
+      head.fit(probs, labels, queryFeatures, options);
+    }
+  }
+
+  // Online update for all heads.
+  update(
+    probs: number[] | number[][],
+    label: number | number[],
+    queryFeatures: number[] | number[][],
+    options: {
+      learningRate?: number;
+      momentum?: number;
+      decayTau?: number;
+      maxGradNorm?: number;
+      avgDecay?: number;
+    } = {},
+  ): void {
+    for (const head of this._heads) {
+      head.update(probs, label, queryFeatures, options);
+    }
+  }
+
+  // Compute fused upper bounds across heads (Corollary 8.7.2).
+  //
+  // Each head computes its upper bound independently.  The final
+  // upper bound averages the per-head upper bound log-odds and
+  // applies sigmoid.
+  computeUpperBounds(
+    upperBoundProbs: number[][],
+    queryFeatures: number[] | number[][],
+    useAveraged: boolean = false,
+  ): number[] {
+    const headBounds: number[][] = [];
+    for (const head of this._heads) {
+      headBounds.push(
+        head.computeUpperBounds(
+          upperBoundProbs,
+          queryFeatures,
+          useAveraged,
+        ),
+      );
+    }
+
+    const nSamples = headBounds[0]!.length;
+    const results: number[] = [];
+    for (let i = 0; i < nSamples; i++) {
+      let sum = 0;
+      for (let h = 0; h < this._nHeads; h++) {
+        const clamped = clampProbability(headBounds[h]![i]!) as number;
+        sum += logit(clamped) as number;
+      }
+      results.push(sigmoid(sum / this._nHeads) as number);
+    }
+    return results;
+  }
+
+  // Prune candidates using multi-head upper bounds (Corollary 8.7.2).
+  prune(
+    probs: number[][],
+    queryFeatures: number[] | number[][],
+    threshold: number,
+    upperBoundProbs?: number[][],
+    useAveraged: boolean = false,
+  ): { survivingIndices: number[]; fusedProbabilities: number[] } {
+    const ubProbs = upperBoundProbs !== undefined ? upperBoundProbs : probs;
+    const upperBounds = this.computeUpperBounds(
+      ubProbs,
+      queryFeatures,
+      useAveraged,
+    );
+
+    const survivingIndices: number[] = [];
+    for (let i = 0; i < upperBounds.length; i++) {
+      if (upperBounds[i]! >= threshold) {
+        survivingIndices.push(i);
+      }
+    }
+
+    if (survivingIndices.length === 0) {
+      return { survivingIndices: [], fusedProbabilities: [] };
+    }
+
+    const survProbs = survivingIndices.map((i) => probs[i]!);
+
+    // Ensure 2D query features
+    const qf2D =
+      typeof queryFeatures[0] === "number"
+        ? [queryFeatures as number[]]
+        : (queryFeatures as number[][]);
+    const survQF =
+      qf2D.length > 1
+        ? survivingIndices.map((i) => qf2D[i]!)
+        : qf2D;
+
+    const fusedProbabilities = this.combine(
+      survProbs,
+      survQF,
+      useAveraged,
+    ) as number[];
+
+    return { survivingIndices, fusedProbabilities };
   }
 }

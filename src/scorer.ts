@@ -614,3 +614,98 @@ export class BayesianBM25Scorer {
     return probabilities;
   }
 }
+
+// Block-max index for BMW-style upper bounds (Paper 1, Section 6.2).
+//
+// Partitions documents into fixed-size blocks and stores per-block
+// maximum BM25 contribution for each term.  Block-level upper bounds
+// are tighter than global WAND upper bounds because they exploit
+// locality in the posting list.
+export class BlockMaxIndex {
+  private _blockSize: number;
+  private _blockMaxes: number[][] | null = null; // (nTerms, nBlocks)
+  private _nDocs: number = 0;
+  private _nTerms: number = 0;
+
+  constructor(blockSize: number = 128) {
+    if (blockSize < 1) {
+      throw new Error(`block_size must be >= 1, got ${blockSize}`);
+    }
+    this._blockSize = blockSize;
+  }
+
+  // Build block-max index from a per-term score matrix.
+  //
+  // scoreMatrix: array of shape (nTerms, nDocs) where each row
+  // contains the per-term BM25 contributions for each document.
+  build(scoreMatrix: number[][]): void {
+    if (scoreMatrix.length === 0) {
+      throw new Error(
+        "score_matrix must be 2D (n_terms, n_docs), got empty array",
+      );
+    }
+    const nTerms = scoreMatrix.length;
+    const nDocs = scoreMatrix[0]!.length;
+    this._nTerms = nTerms;
+    this._nDocs = nDocs;
+
+    const bs = this._blockSize;
+    const nBlocks = Math.ceil(nDocs / bs);
+
+    const blockMaxes: number[][] = [];
+    for (let t = 0; t < nTerms; t++) {
+      const termRow = scoreMatrix[t]!;
+      const termBlockMaxes: number[] = [];
+      for (let b = 0; b < nBlocks; b++) {
+        const start = b * bs;
+        const end = Math.min(start + bs, nDocs);
+        let maxVal = -Infinity;
+        for (let d = start; d < end; d++) {
+          if (termRow[d]! > maxVal) {
+            maxVal = termRow[d]!;
+          }
+        }
+        termBlockMaxes.push(maxVal);
+      }
+      blockMaxes.push(termBlockMaxes);
+    }
+
+    this._blockMaxes = blockMaxes;
+  }
+
+  // Return the per-term BM25 upper bound for a specific block.
+  blockUpperBound(termIdx: number, blockId: number): number {
+    if (this._blockMaxes === null) {
+      throw new Error("Call build() before blockUpperBound().");
+    }
+    return this._blockMaxes[termIdx]![blockId]!;
+  }
+
+  // Bayesian probability upper bound for a block (Corollary 7.4.2).
+  //
+  // Delegates to transform.wandUpperBound() using the block-level
+  // BM25 maximum, producing a tighter bound than the global WAND
+  // upper bound.
+  bayesianBlockUpperBound(
+    termIdx: number,
+    blockId: number,
+    transform: BayesianProbabilityTransform,
+    pMax: number = 0.9,
+  ): number {
+    const blockMax = this.blockUpperBound(termIdx, blockId);
+    return transform.wandUpperBound(blockMax) as number;
+  }
+
+  // Number of documents per block.
+  get blockSize(): number {
+    return this._blockSize;
+  }
+
+  // Total number of blocks.
+  get nBlocks(): number {
+    if (this._blockMaxes === null) {
+      throw new Error("Call build() before accessing nBlocks.");
+    }
+    return this._blockMaxes[0]!.length;
+  }
+}

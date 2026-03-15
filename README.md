@@ -8,19 +8,23 @@ Standard BM25 produces unbounded scores that lack consistent meaning across quer
 
 Key capabilities:
 
-- **Score-to-probability transform** -- convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
-- **Base rate calibration** -- corpus-level base rate prior estimated from score distribution (95th percentile, mixture model, or elbow detection) decomposes the posterior into three additive log-odds terms
-- **Parameter learning** -- batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
-- **Probabilistic fusion** -- combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish activations from Paper 2, Theorems 6.5.3/6.7.4)
-- **Learnable fusion weights** -- `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2)
-- **Attention-based fusion** -- `AttentionLogOddsWeights` learns query-dependent signal weights via attention mechanism (Paper 2, Section 8), replacing static weights with query-adaptive weighting
-- **Hybrid search** -- `cosineToProbability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
-- **Balanced fusion** -- `balancedLogOddsFusion()` min-max normalizes sparse and dense logits to equalize voting power before combining, preventing heavy-tailed BM25 logits from drowning the dense signal
-- **WAND pruning** -- `wandUpperBound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
-- **Calibration metrics** -- `expectedCalibrationError()`, `brierScore()`, `reliabilityDiagram()`, and `calibrationReport()` for evaluating probability quality, with `CalibrationReport` bundling all metrics into a single diagnostic
-- **Fusion debugging** -- `FusionDebugger` records every intermediate value through the full pipeline (likelihood, prior, posterior, fusion) for transparent inspection, document comparison, and crossover detection; supports hierarchical fusion tracing with AND/OR/NOT composition
-- **Multi-field search** -- `MultiFieldScorer` maintains separate BM25 indexes per field and fuses field-level probabilities via log-odds conjunction with configurable per-field weights
-- **Search integration** -- built-in BM25 scorer that returns probabilities instead of raw scores, with support for Robertson, Lucene, and ATIRE variants
+- **Score-to-probability transform** — convert raw BM25 scores into calibrated relevance probabilities via sigmoid likelihood + composite prior + Bayesian posterior
+- **Base rate calibration** — corpus-level base rate prior estimated from score distribution (95th percentile, mixture model, or elbow detection) decomposes the posterior into three additive log-odds terms
+- **Parameter learning** — batch gradient descent or online SGD with EMA-smoothed gradients and Polyak averaging, with three training modes: balanced (C1), prior-aware (C2), and prior-free (C3)
+- **Probabilistic fusion** — combine multiple probability signals using AND, OR, NOT, and log-odds conjunction with multiplicative confidence scaling, optional per-signal reliability weights (Log-OP), and sparse signal gating (ReLU/Swish/GELU activations from Paper 2, Theorems 6.5.3/6.7.4/6.8.1)
+- **Learnable fusion weights** — `LearnableLogOddsWeights` learns per-signal reliability from labeled data via a Hebbian gradient that is backprop-free, starting from Naive Bayes uniform initialization (Remark 5.3.2), with optional corpus-level base rate prior
+- **Attention-based fusion** — `AttentionLogOddsWeights` learns query-dependent signal weights via attention mechanism (Paper 2, Section 8), with `computeUpperBounds()` and `prune()` for safe candidate pruning (Theorem 8.7.1)
+- **Multi-head attention fusion** — `MultiHeadAttentionLogOddsWeights` creates multiple attention heads with different initializations and averages in log-odds space for robust fusion (Remark 8.6, Corollary 8.7.2)
+- **Hybrid search** — `cosineToProbability()` converts vector similarity scores to probabilities for fusion with BM25 signals via weighted log-odds conjunction
+- **Balanced fusion** — `balancedLogOddsFusion()` min-max normalizes sparse and dense logits to equalize voting power before combining, preventing heavy-tailed BM25 logits from drowning the dense signal
+- **Temporal adaptation** — `TemporalBayesianTransform` applies exponential decay weighting so recent observations receive higher influence during parameter learning (Section 12.2 #3)
+- **Neural score calibration** — `PlattCalibrator` (sigmoid) and `IsotonicCalibrator` (PAVA) convert raw scores from neural models into calibrated probabilities suitable for Bayesian fusion
+- **WAND pruning** — `wandUpperBound()` computes safe Bayesian probability upper bounds for document pruning in top-k retrieval
+- **BMW block-max pruning** — `BlockMaxIndex` partitions documents into blocks and stores per-block maximum scores for tighter upper bounds than global WAND (Section 6.2)
+- **Calibration metrics** — `expectedCalibrationError()`, `brierScore()`, `reliabilityDiagram()`, and `calibrationReport()` for evaluating probability quality, with `CalibrationReport` bundling all metrics into a single diagnostic
+- **Fusion debugging** — `FusionDebugger` records every intermediate value through the full pipeline (likelihood, prior, posterior, fusion) for transparent inspection, document comparison, and crossover detection; supports hierarchical fusion tracing with AND/OR/NOT composition
+- **Multi-field search** — `MultiFieldScorer` maintains separate BM25 indexes per field and fuses field-level probabilities via log-odds conjunction with configurable per-field weights
+- **Search integration** — built-in BM25 scorer that returns probabilities instead of raw scores, with support for Robertson, Lucene, and ATIRE variants
 
 ## Installation
 
@@ -129,6 +133,10 @@ const fusedScaled = logOddsConjunction(stacked, 0.5, [0.6, 0.4]);
 // Gated fusion: ReLU/Swish activation in logit space (Paper 2, Theorems 6.5.3/6.7.4)
 const fusedRelu = logOddsConjunction(stacked, undefined, undefined, "relu");   // MAP estimation
 const fusedSwish = logOddsConjunction(stacked, undefined, undefined, "swish"); // Bayes estimation
+const fusedGelu = logOddsConjunction(stacked, undefined, undefined, "gelu");   // Gaussian approx
+
+// Generalized Swish with custom beta (Theorem 6.7.6)
+const fusedSwish2 = logOddsConjunction(stacked, undefined, undefined, "swish", 2.0);
 ```
 
 ### Balanced Sparse-Dense Fusion
@@ -195,6 +203,79 @@ attn.fit(trainingProbs, trainingLabels, queryFeatures, {
 const fused = attn.combine(testProbs, testFeatures, true);
 ```
 
+### Multi-Head Attention Fusion
+
+```typescript
+import { MultiHeadAttentionLogOddsWeights } from "bayesian-bm25";
+
+// 4 heads, 2 signals, 3 query features
+const mh = new MultiHeadAttentionLogOddsWeights(4, 2, 3, 0.5);
+
+// Train all heads on the same data (diversity from different random seeds)
+mh.fit(trainingProbs, trainingLabels, queryFeatures, {
+  learningRate: 0.01,
+  maxIterations: 500,
+});
+
+// Fused probability via multi-head log-odds averaging
+const fused = mh.combine(testProbs, testFeatures);
+
+// Pruning with multi-head upper bounds (Corollary 8.7.2)
+const { survivingIndices, fusedProbabilities } = mh.prune(
+  candidateProbs,
+  queryFeatures,
+  0.5, // threshold
+);
+```
+
+### Neural Score Calibration
+
+```typescript
+import { PlattCalibrator, IsotonicCalibrator } from "bayesian-bm25";
+
+// Sigmoid calibration: P = sigmoid(a * score + b)
+const platt = new PlattCalibrator();
+platt.fit(rawScores, relevanceLabels, { learningRate: 0.01 });
+const calibrated = platt.calibrate(newScores);
+
+// Non-parametric monotone calibration via PAVA
+const isotonic = new IsotonicCalibrator();
+isotonic.fit(rawScores, relevanceLabels);
+const calibrated2 = isotonic.calibrate(newScores);
+```
+
+### Temporal Parameter Adaptation
+
+```typescript
+import { TemporalBayesianTransform } from "bayesian-bm25";
+
+// Recent observations have 50% weight after 500 observations
+const transform = new TemporalBayesianTransform(1.0, 0.0, null, 500.0);
+
+// Batch fit with timestamps (recent samples weighted more)
+transform.fit(scores, labels, { timestamps });
+
+// Online update: timestamp auto-increments
+transform.update(newScore, newLabel);
+console.log(transform.timestamp); // 1
+```
+
+### BMW Block-Max Pruning
+
+```typescript
+import { BlockMaxIndex, BayesianProbabilityTransform } from "bayesian-bm25";
+
+const bmw = new BlockMaxIndex(64); // 64 docs per block
+
+// scoreMatrix[term][doc] = per-term BM25 contribution
+bmw.build(scoreMatrix);
+
+const transform = new BayesianProbabilityTransform(1.5, 2.0);
+
+// Block-level Bayesian upper bound (tighter than global WAND)
+const bound = bmw.bayesianBlockUpperBound(termIdx, blockId, transform);
+```
+
 ### Debugging Fusion Decisions
 
 ```typescript
@@ -229,7 +310,7 @@ const transform = new BayesianProbabilityTransform(1.5, 2.0, 0.01);
 // Standard BM25 upper bound per query term
 const bm25UpperBound = 5.0;
 
-// Bayesian upper bound for safe pruning -- any document's actual
+// Bayesian upper bound for safe pruning — any document's actual
 // probability is guaranteed to be at most this value
 const bayesianBound = transform.wandUpperBound(bm25UpperBound);
 ```
@@ -300,7 +381,7 @@ transform.fit(scores, labels, { mode: "prior_free" });
 Core class for converting BM25 scores to calibrated probabilities.
 
 ```typescript
-new BayesianProbabilityTransform(alpha?, beta?, baseRate?)
+new BayesianProbabilityTransform(alpha?, beta?, baseRate?, priorFn?)
 ```
 
 | Method | Description |
@@ -348,17 +429,17 @@ The `baseRateMethod` option controls how "auto" base rate is estimated: `"percen
 | `probNot(prob)` | Probabilistic NOT via complement rule: `1 - P(R)` (Eq. 35) |
 | `probAnd(probs)` | Probabilistic AND via product rule (Eq. 33-34) |
 | `probOr(probs)` | Probabilistic OR via complement rule (Eq. 36-37) |
-| `logOddsConjunction(probs, alpha?, weights?, gating?)` | Log-odds conjunction with optional per-signal weights (Theorem 8.3) and ReLU/Swish gating (Theorems 6.5.3/6.7.4) |
+| `logOddsConjunction(probs, alpha?, weights?, gating?, gatingBeta?)` | Log-odds conjunction with optional per-signal weights (Theorem 8.3) and ReLU/Swish/GELU gating (Theorems 6.5.3/6.7.4/6.8.1) |
 | `balancedLogOddsFusion(sparse, dense, weight?)` | Min-max normalized logit fusion for hybrid sparse-dense retrieval |
 
-`probNot` accepts scalar (`number`) or array (`number[]`) inputs. Other fusion functions accept 1D (`number[]`) or batched 2D (`number[][]`) inputs. `alpha` accepts `number`, `"auto"` (resolves to 0.5, implementing the sqrt(n) scaling law from Paper 2, Theorem 4.2.1), or `undefined`. `gating` accepts `"none"` (default), `"relu"`, or `"swish"`.
+`probNot` accepts scalar (`number`) or array (`number[]`) inputs. Other fusion functions accept 1D (`number[]`) or batched 2D (`number[][]`) inputs. `alpha` accepts `number`, `"auto"` (resolves to 0.5, implementing the sqrt(n) scaling law from Paper 2, Theorem 4.2.1), or `undefined`. `gating` accepts `"none"` (default), `"relu"`, `"swish"`, or `"gelu"`. `gatingBeta` controls generalized Swish sharpness (default 1.0; ignored for GELU).
 
 ### LearnableLogOddsWeights
 
 Learns per-signal reliability weights via Hebbian gradient descent (Remark 5.3.2).
 
 ```typescript
-new LearnableLogOddsWeights(nSignals, alpha?)
+new LearnableLogOddsWeights(nSignals, alpha?, baseRate?)
 ```
 
 | Method | Description |
@@ -367,7 +448,7 @@ new LearnableLogOddsWeights(nSignals, alpha?)
 | `fit(signalsBatch, labels, options?)` | Batch gradient descent on BCE loss |
 | `update(signals, label, options?)` | Online SGD with EMA gradients and Polyak averaging |
 
-Properties: `weights`, `averagedWeights`, `nSignals`, `alpha`
+Properties: `weights`, `averagedWeights`, `nSignals`, `alpha`, `baseRate`
 
 **FitOptions**: `learningRate`, `maxIterations`, `tolerance`, `useAveraged`
 
@@ -378,7 +459,7 @@ Properties: `weights`, `averagedWeights`, `nSignals`, `alpha`
 Learns query-dependent signal weights via linear attention projection (Paper 2, Section 8).
 
 ```typescript
-new AttentionLogOddsWeights(nSignals, nQueryFeatures, alpha?)
+new AttentionLogOddsWeights(nSignals, nQueryFeatures, alpha?, normalize?, seed?, baseRate?)
 ```
 
 | Method | Description |
@@ -386,12 +467,70 @@ new AttentionLogOddsWeights(nSignals, nQueryFeatures, alpha?)
 | `combine(probs, queryFeatures, useAveraged?)` | Fuse signals with query-dependent weights |
 | `fit(signalsBatch, labels, queryFeatures, options?)` | Batch gradient descent on BCE loss |
 | `update(signals, label, queryFeatures, options?)` | Online SGD with EMA gradients and Polyak averaging |
+| `computeUpperBounds(upperBoundProbs, queryFeatures, useAveraged?)` | Fused probability upper bounds (Theorem 8.7.1) |
+| `prune(probs, queryFeatures, threshold, upperBoundProbs?, useAveraged?)` | Prune candidates below threshold |
 
-Properties: `weightsMatrix`, `nSignals`, `nQueryFeatures`, `alpha`
+Properties: `weightsMatrix`, `nSignals`, `nQueryFeatures`, `alpha`, `baseRate`, `normalize`
 
-**FitOptions**: `learningRate`, `maxIterations`, `tolerance`, `useAveraged`
+**FitOptions**: `learningRate`, `maxIterations`, `tolerance`, `queryIds`
 
 **UpdateOptions**: `learningRate`, `momentum`, `decayTau`, `maxGradNorm`, `avgDecay`
+
+### MultiHeadAttentionLogOddsWeights
+
+Multi-head attention fusion with log-odds averaging (Paper 2, Remark 8.6, Corollary 8.7.2).
+
+```typescript
+new MultiHeadAttentionLogOddsWeights(nHeads, nSignals, nQueryFeatures, alpha?, normalize?)
+```
+
+| Method | Description |
+|---|---|
+| `combine(probs, queryFeatures, useAveraged?)` | Multi-head log-odds averaging + sigmoid |
+| `fit(signalsBatch, labels, queryFeatures, options?)` | Train all heads on the same data |
+| `update(signals, label, queryFeatures, options?)` | Online update for all heads |
+| `computeUpperBounds(upperBoundProbs, queryFeatures, useAveraged?)` | Multi-head upper bounds (Corollary 8.7.2) |
+| `prune(probs, queryFeatures, threshold, upperBoundProbs?, useAveraged?)` | Prune using multi-head upper bounds |
+
+Properties: `nHeads`, `heads`
+
+### TemporalBayesianTransform
+
+BayesianProbabilityTransform with time-weighted parameter adaptation (Paper 1, Section 12.2 #3).
+
+```typescript
+new TemporalBayesianTransform(alpha?, beta?, baseRate?, decayHalfLife?)
+```
+
+| Method | Description |
+|---|---|
+| `fit(scores, labels, options?)` | Gradient descent with temporal sample weighting via `timestamps` option |
+| `update(score, label, options?)` | Online SGD with auto-incrementing timestamp |
+
+Properties: `decayHalfLife`, `timestamp` (plus all inherited from `BayesianProbabilityTransform`)
+
+### Neural Score Calibration
+
+| Class | Description |
+|---|---|
+| `PlattCalibrator(a?, b?)` | Sigmoid calibration: `P = sigmoid(a * score + b)` with BCE gradient descent `fit()` and `calibrate()` |
+| `IsotonicCalibrator()` | Non-parametric monotone calibration via PAVA with binary search + linear interpolation `calibrate()` |
+
+### BlockMaxIndex
+
+Block-max index for BMW-style upper bounds (Paper 1, Section 6.2).
+
+```typescript
+new BlockMaxIndex(blockSize?)
+```
+
+| Method | Description |
+|---|---|
+| `build(scoreMatrix)` | Build block-max index from per-term score matrix `number[][]` (nTerms x nDocs) |
+| `blockUpperBound(termIdx, blockId)` | Per-term BM25 upper bound for a specific block |
+| `bayesianBlockUpperBound(termIdx, blockId, transform, pMax?)` | Bayesian probability upper bound for a block |
+
+Properties: `blockSize`, `nBlocks`
 
 ### MultiFieldScorer
 
@@ -436,8 +575,8 @@ Fusion methods: `"log_odds"` (default), `"prob_and"`, `"prob_or"`, `"prob_not"`
 
 | Function | Description |
 |---|---|
-| `expectedCalibrationError(probabilities, labels, nBins?)` | Expected Calibration Error -- measures predicted vs actual relevance rates |
-| `brierScore(probabilities, labels)` | Brier score -- mean squared error between probabilities and labels |
+| `expectedCalibrationError(probabilities, labels, nBins?)` | Expected Calibration Error — measures predicted vs actual relevance rates |
+| `brierScore(probabilities, labels)` | Brier score — mean squared error between probabilities and labels |
 | `reliabilityDiagram(probabilities, labels, nBins?)` | Reliability diagram data: `[avgPredicted, avgActual, count]` per bin |
 | `calibrationReport(probabilities, labels, nBins?)` | One-call diagnostic: returns `CalibrationReport` with ECE, Brier, reliability, and `summary()` |
 

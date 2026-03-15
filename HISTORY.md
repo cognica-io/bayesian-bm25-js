@@ -1,5 +1,47 @@
 # History
 
+## 0.7.0 (2026-03-15)
+
+- Add `TemporalBayesianTransform` for time-weighted parameter adaptation (Paper 1, Section 12.2 #3)
+  - Extends `BayesianProbabilityTransform` with exponential decay weighting so recent observations receive higher influence during training
+  - `fit()` accepts optional `timestamps` array; sample gradients are weighted by `exp(-decayRate * (maxTs - ts_i))` where `decayRate = ln(2) / decayHalfLife`
+  - `update()` increments an internal timestamp counter and progressively reduces Polyak `avgDecay` so averaged parameters respond faster to recent data
+  - Properties: `decayHalfLife`, `timestamp`
+- Add `priorFn` parameter to `BayesianProbabilityTransform` constructor (Paper 1, Section 12.2 #6)
+  - Custom prior function replaces the composite prior at inference time when mode is not `"prior_free"`
+  - Accepts `(score, tf, docLenRatio) => number | number[]`
+- Add GELU gating to `logOddsConjunction` (Paper 2, Theorem 6.8.1, Proposition 6.8.2)
+  - `gating="gelu"`: Bayesian expected signal under Gaussian noise model, approximated as `logit * sigmoid(1.702 * logit)`, matching `Swish_{1.702}`
+  - The `gatingBeta` parameter is ignored for GELU
+- Add generalized Swish `gatingBeta` parameter to `logOddsConjunction` (Paper 2, Theorem 6.7.6)
+  - Controls the sharpness of the swish gate: `logit * sigmoid(beta * logit)`
+  - `beta=1.0` (default) is the standard swish; `beta -> inf` approaches ReLU; `beta -> 0` approaches `x/2`
+- Add `baseRate` parameter to `LearnableLogOddsWeights`
+  - Corpus-level base rate prior added as additive bias in log-odds space during `combine()`, `fit()`, and `update()`
+  - Accepts `null` (default, no correction) or `number` in (0, 1)
+- Add `seed` and `baseRate` parameters to `AttentionLogOddsWeights`
+  - `seed` controls deterministic PRNG initialization for the weight matrix (previously hardcoded to 0)
+  - `baseRate` adds corpus-level prior in log-odds space (same semantics as `LearnableLogOddsWeights`)
+- Add `computeUpperBounds()` and `prune()` to `AttentionLogOddsWeights` (Paper 2, Theorem 8.7.1)
+  - `computeUpperBounds()`: computes fused probability upper bounds from per-signal upper bounds and query features
+  - `prune()`: filters candidates whose upper bound is below threshold, returning surviving indices and fused probabilities
+- Add `MultiHeadAttentionLogOddsWeights` for multi-head attention fusion (Paper 2, Remark 8.6, Corollary 8.7.2)
+  - Creates multiple independent `AttentionLogOddsWeights` heads, each initialized with a different random seed for diversity
+  - `combine()`: each head produces fused log-odds independently; results are averaged in log-odds space then converted to probability via sigmoid
+  - `fit()`, `update()`: trains/updates all heads on the same data
+  - `computeUpperBounds()`, `prune()`: multi-head upper bounds for safe pruning
+- Add `PlattCalibrator` for sigmoid score calibration (Paper 1, Section 12.2 #5; Paper 2, Section 5.1)
+  - Learns `a` and `b` via BCE gradient descent so `sigmoid(a * score + b)` produces well-calibrated probabilities
+  - `fit()`, `calibrate()` with scalar/array overloads
+- Add `IsotonicCalibrator` for non-parametric monotone calibration
+  - Pool Adjacent Violators Algorithm (PAVA) produces monotonically non-decreasing score-to-probability mapping
+  - `calibrate()` uses binary search with linear interpolation at inference
+- Add `BlockMaxIndex` for BMW-style block-max upper bounds (Paper 1, Section 6.2)
+  - Partitions documents into fixed-size blocks and stores per-block maximum BM25 contribution per term
+  - Block-level upper bounds are tighter than global WAND bounds, enabling more aggressive pruning
+  - `build()`, `blockUpperBound()`, `bayesianBlockUpperBound()`
+  - Properties: `blockSize`, `nBlocks`
+
 ## 0.6.0 (2026-03-05)
 
 - Add `normalize` parameter to `AttentionLogOddsWeights` for per-signal logit normalization

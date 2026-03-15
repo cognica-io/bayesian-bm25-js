@@ -6,6 +6,7 @@
 
 export {
   BayesianProbabilityTransform,
+  TemporalBayesianTransform,
   sigmoid,
   logit,
   clampProbability,
@@ -13,6 +14,7 @@ export {
   type FitOptions,
   type UpdateOptions,
   type TrainingMode,
+  type TemporalFitOptions,
 } from "./probability.js";
 
 export {
@@ -24,8 +26,14 @@ export {
   balancedLogOddsFusion,
   LearnableLogOddsWeights,
   AttentionLogOddsWeights,
+  MultiHeadAttentionLogOddsWeights,
   resolveAlpha,
 } from "./fusion.js";
+
+export {
+  PlattCalibrator,
+  IsotonicCalibrator,
+} from "./calibration.js";
 
 export {
   expectedCalibrationError,
@@ -37,6 +45,7 @@ export {
 
 export {
   BayesianBM25Scorer,
+  BlockMaxIndex,
   type BayesianBM25ScorerOptions,
   type RetrieveResult,
   type RetrievalResult,

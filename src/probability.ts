@@ -100,17 +100,32 @@ export class BayesianProbabilityTransform {
   public readonly baseRate: number | null;
 
   private _logitBaseRate: number | null;
-  private _trainingMode: TrainingMode = "balanced";
-  private _nUpdates: number = 0;
-  private _gradAlphaEMA: number = 0.0;
-  private _gradBetaEMA: number = 0.0;
-  private _alphaAvg: number;
-  private _betaAvg: number;
+  protected _trainingMode: TrainingMode = "balanced";
+  protected _nUpdates: number = 0;
+  protected _gradAlphaEMA: number = 0.0;
+  protected _gradBetaEMA: number = 0.0;
+  protected _alphaAvg: number;
+  protected _betaAvg: number;
+
+  protected _priorFn:
+    | ((
+        score: number | number[],
+        tf: number | number[],
+        docLenRatio: number | number[],
+      ) => number | number[])
+    | null;
 
   constructor(
     alpha: number = 1.0,
     beta: number = 0.0,
     baseRate: number | null = null,
+    priorFn:
+      | ((
+          score: number | number[],
+          tf: number | number[],
+          docLenRatio: number | number[],
+        ) => number | number[])
+      | null = null,
   ) {
     if (baseRate !== null) {
       if (baseRate <= 0.0 || baseRate >= 1.0) {
@@ -120,6 +135,7 @@ export class BayesianProbabilityTransform {
     this.alpha = alpha;
     this.beta = beta;
     this.baseRate = baseRate;
+    this._priorFn = priorFn;
     this._logitBaseRate =
       baseRate !== null ? (logitScalar(baseRate) as number) : null;
     this._alphaAvg = alpha;
@@ -285,10 +301,17 @@ export class BayesianProbabilityTransform {
       Array.isArray(docLenRatio)
     ) {
       const lVal = this.likelihood(score);
-      const prior =
-        this._trainingMode === "prior_free"
-          ? score.map(() => 0.5)
-          : BayesianProbabilityTransform.compositePrior(tf, docLenRatio);
+      let prior: number[];
+      if (this._trainingMode === "prior_free") {
+        prior = score.map(() => 0.5);
+      } else if (this._priorFn !== null) {
+        const customPrior = this._priorFn(score, tf, docLenRatio);
+        prior = clampProbability(
+          Array.isArray(customPrior) ? customPrior : score.map(() => customPrior),
+        ) as number[];
+      } else {
+        prior = BayesianProbabilityTransform.compositePrior(tf, docLenRatio);
+      }
 
       return BayesianProbabilityTransform.posterior(
         lVal,
@@ -298,13 +321,24 @@ export class BayesianProbabilityTransform {
     }
 
     const lVal = this.likelihood(score as number) as number;
-    const prior =
-      this._trainingMode === "prior_free"
-        ? 0.5
-        : (BayesianProbabilityTransform.compositePrior(
-            tf as number,
-            docLenRatio as number,
-          ) as number);
+    let prior: number;
+    if (this._trainingMode === "prior_free") {
+      prior = 0.5;
+    } else if (this._priorFn !== null) {
+      const customPrior = this._priorFn(
+        score as number,
+        tf as number,
+        docLenRatio as number,
+      );
+      prior = clampProbability(
+        Array.isArray(customPrior) ? customPrior[0]! : customPrior,
+      ) as number;
+    } else {
+      prior = BayesianProbabilityTransform.compositePrior(
+        tf as number,
+        docLenRatio as number,
+      ) as number;
+    }
 
     return BayesianProbabilityTransform.posterior(lVal, prior, this.baseRate);
   }
@@ -565,5 +599,187 @@ export class BayesianProbabilityTransform {
     this._alphaAvg =
       avgDecay * this._alphaAvg + (1.0 - avgDecay) * this.alpha;
     this._betaAvg = avgDecay * this._betaAvg + (1.0 - avgDecay) * this.beta;
+  }
+}
+
+export interface TemporalFitOptions extends FitOptions {
+  timestamps?: number[];
+}
+
+// BayesianProbabilityTransform with time-weighted parameter adaptation.
+//
+// Recent observations receive higher weight in the gradient computation,
+// allowing the transform to adapt to non-stationary relevance patterns
+// (Paper 1, Section 12.2 #3).
+export class TemporalBayesianTransform extends BayesianProbabilityTransform {
+  private _decayHalfLife: number;
+  private _decayRate: number;
+  private _timestamp: number = 0;
+
+  constructor(
+    alpha: number = 1.0,
+    beta: number = 0.0,
+    baseRate: number | null = null,
+    decayHalfLife: number = 1000.0,
+  ) {
+    if (decayHalfLife <= 0.0) {
+      throw new Error(
+        `decayHalfLife must be positive, got ${decayHalfLife}`,
+      );
+    }
+    super(alpha, beta, baseRate);
+    this._decayHalfLife = decayHalfLife;
+    this._decayRate = Math.log(2.0) / decayHalfLife;
+  }
+
+  get decayHalfLife(): number {
+    return this._decayHalfLife;
+  }
+
+  get timestamp(): number {
+    return this._timestamp;
+  }
+
+  // Learn alpha and beta with temporal weighting.
+  //
+  // When timestamps is provided, each sample's gradient is
+  // weighted by exp(-decayRate * (maxTs - ts_i)), giving
+  // recent observations more influence on the learned parameters.
+  fit(
+    scores: number[],
+    labels: number[],
+    options: TemporalFitOptions = {},
+  ): void {
+    const {
+      learningRate = 0.01,
+      maxIterations = 1000,
+      tolerance = 1e-6,
+      mode = "balanced",
+      tfs,
+      docLenRatios,
+      timestamps,
+    } = options;
+
+    if (!VALID_MODES.has(mode)) {
+      throw new Error(
+        `mode must be one of "balanced", "prior_aware", "prior_free", got "${mode}"`,
+      );
+    }
+    if (mode === "prior_aware") {
+      if (tfs === undefined || docLenRatios === undefined) {
+        throw new Error(
+          "tfs and docLenRatios are required when mode='prior_aware'",
+        );
+      }
+    }
+
+    // Compute temporal weights
+    let sampleWeights: number[];
+    if (timestamps !== undefined) {
+      let maxTs = -Infinity;
+      for (const ts of timestamps) {
+        if (ts > maxTs) maxTs = ts;
+      }
+      sampleWeights = timestamps.map((ts) =>
+        Math.exp(-this._decayRate * (maxTs - ts)),
+      );
+      // Normalize so weights sum to len(scores) for consistent gradient magnitude
+      let weightSum = 0;
+      for (const w of sampleWeights) {
+        weightSum += w;
+      }
+      const normFactor = scores.length / weightSum;
+      sampleWeights = sampleWeights.map((w) => w * normFactor);
+    } else {
+      sampleWeights = new Array(scores.length).fill(1.0);
+    }
+
+    let priors: number[] | null = null;
+    if (mode === "prior_aware") {
+      priors = BayesianProbabilityTransform.compositePrior(
+        tfs!,
+        docLenRatios!,
+      );
+    }
+
+    let alpha = this.alpha;
+    let beta = this.beta;
+
+    for (let iter = 0; iter < maxIterations; iter++) {
+      const L = scores.map((s) =>
+        clampScalar(sigmoidScalar(alpha * (s - beta))),
+      );
+
+      let gradAlpha = 0;
+      let gradBeta = 0;
+
+      if (mode === "prior_aware") {
+        for (let i = 0; i < scores.length; i++) {
+          const lv = L[i]!;
+          const p = priors![i]!;
+          const denom = lv * p + (1.0 - lv) * (1.0 - p);
+          const predicted = clampScalar((lv * p) / denom);
+
+          const dP_dL = (p * (1.0 - p)) / (denom * denom);
+          const dL_dalpha = lv * (1.0 - lv) * (scores[i]! - beta);
+          const dL_dbeta = -lv * (1.0 - lv) * alpha;
+
+          const error = predicted - labels[i]!;
+          gradAlpha += sampleWeights[i]! * error * dP_dL * dL_dalpha;
+          gradBeta += sampleWeights[i]! * error * dP_dL * dL_dbeta;
+        }
+      } else {
+        for (let i = 0; i < scores.length; i++) {
+          const error = L[i]! - labels[i]!;
+          gradAlpha += sampleWeights[i]! * error * (scores[i]! - beta);
+          gradBeta += sampleWeights[i]! * error * -alpha;
+        }
+      }
+
+      gradAlpha /= scores.length;
+      gradBeta /= scores.length;
+
+      const newAlpha = alpha - learningRate * gradAlpha;
+      const newBeta = beta - learningRate * gradBeta;
+
+      if (
+        Math.abs(newAlpha - alpha) < tolerance &&
+        Math.abs(newBeta - beta) < tolerance
+      ) {
+        alpha = newAlpha;
+        beta = newBeta;
+        break;
+      }
+
+      alpha = newAlpha;
+      beta = newBeta;
+    }
+
+    this.alpha = alpha;
+    this.beta = beta;
+    this._trainingMode = mode;
+    this._nUpdates = 0;
+    this._gradAlphaEMA = 0.0;
+    this._gradBetaEMA = 0.0;
+    this._alphaAvg = alpha;
+    this._betaAvg = beta;
+  }
+
+  // Online update with incrementing internal timestamp.
+  //
+  // Increments the timestamp counter and reduces the Polyak avgDecay
+  // over time so newer observations dominate the averaged parameters.
+  update(
+    score: number | number[],
+    label: number | number[],
+    options: UpdateOptions = {},
+  ): void {
+    this._timestamp += 1;
+    const avgDecay = options.avgDecay ?? 0.995;
+    // Reduce avgDecay slightly as more observations arrive,
+    // so the averaged parameters respond faster to recent data
+    const effectiveAvgDecay =
+      avgDecay * (1.0 - 1.0 / (1.0 + this._timestamp));
+    super.update(score, label, { ...options, avgDecay: effectiveAvgDecay });
   }
 }
